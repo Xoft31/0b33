@@ -282,6 +282,6 @@ fn schema_version_on_referral_event() {
     assert_eq!(referral_events.len(), 1);
     assert_eq!(
         referral_events[0].schema_version,
-        crate::EVENT_SCHEMA_VERSION
+        crate::types::BASE_EVENT_SCHEMA_VERSION
     );
 }

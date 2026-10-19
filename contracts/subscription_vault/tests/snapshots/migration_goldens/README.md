@@ -35,6 +35,11 @@ Normal regression tests compare current serialization against the stored golden 
 cargo test --lib --test migration_goldens
 ```
 
+The migration golden test also serializes a frozen v1 `SubscriptionSummary` schema
+fixture (before `expires_at_ledger` was added) and deserializes it using the current
+type. This specifically guards backward-compatible decoding; current-version
+round-trip/determinism checks alone do not cover that behavior.
+
 If a test fails, it means either:
 - The contract serialization is non-deterministic (a bug)
 - The contract has changed in an unintended way

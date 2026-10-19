@@ -8,7 +8,7 @@ These limits are configured by the merchant via the `configure_usage_limits` ent
 
 - `rate_limit_max_calls: Option<u32>`: Maximum allowed usage charges within the rate window.
 - `rate_window_secs: u64`: Duration of the rate limit window in seconds.
-- `burst_min_interval_secs: u64`: Minimum required time (in seconds) between any two consecutive usage charges.
+- `burst_min_interval_secs: u64`: Minimum required time (in seconds) between any two consecutive usage charges. `0` disables burst protection.
 - `usage_cap_units: Option<i128>`: Maximum usage amount allowed per billing period.
 
 ## Enforcement Mechanisms
@@ -16,13 +16,14 @@ These limits are configured by the merchant via the `configure_usage_limits` ent
 ### 1. Burst Protection
 - The contract records `last_usage_timestamp` for each subscription.
 - If a new charge is attempted where `now - last_usage_timestamp < burst_min_interval_secs`, it is rejected with `UsageChargeResult::BurstLimitExceeded`.
+- A configured interval of `0` disables this check, so consecutive usage charges can occur at the same timestamp (other limits and replay protection still apply).
 - **Purpose**: Prevents rapid repeated calls in the same ledger or across very short intervals.
 
-### 2. Time-Based Rate Limits
-- A rolling fixed window counter (`window_call_count`) is kept in contract storage alongside `window_start_timestamp`.
-- When calls in the active window reach `rate_limit_max_calls`, additional usage charges are rejected with `UsageChargeResult::RateLimitExceeded`.
-- Counters reset automatically once the window expires (`now - window_start_timestamp >= rate_window_secs`).
-  - A call at exactly `window_start_timestamp + rate_window_secs` is treated as the first call of a new window.
+### 2. Approximate Time-Window Rate Limits
+- A single counter (`window_call_count`) is stored with `window_start_timestamp`. The window starts with the first accepted usage charge and resets lazily on the first accepted charge at or after `window_start_timestamp + rate_window_secs`.
+- When the counter reaches `rate_limit_max_calls`, further calls in that window are rejected with `UsageChargeResult::RateLimitExceeded`.
+- This is not a true sliding-window limit or a clock-aligned fixed window. Calls can cluster across a reset: for example, with a limit of 5 per 60 seconds, 5 calls near the end of one window and 5 just after its boundary may all be accepted within a short period. Thus, nearly twice the configured count can be accepted in a brief boundary-crossing span.
+- Treat this setting as approximate abuse control, not an exact quota or billing-accuracy guarantee. If strict request pacing is required, enforce it in the metering service with a sliding-window limiter and leave margin below the on-chain limit. Use `usage_cap_units` for the exact per-billing-period amount cap.
 
 ### 3. Replay Protection
 - Every usage charge must include a unique `reference: String` parameter.

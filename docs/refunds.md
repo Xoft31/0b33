@@ -14,6 +14,12 @@ merchant/admin time to respond.
 | `resolve_dispute(admin, dispute_id, resolve_to_subscriber)` | admin | Final resolution; routes escrowed funds to subscriber or merchant. |
 | `get_dispute(dispute_id)` | — | Returns the `Dispute` record. |
 | `get_subscription_dispute(subscription_id)` | — | Returns the active dispute ID for a subscription, if any. |
+| `set_dispute_window_secs(admin, window_secs)` | admin | Changes the global dispute response window; subject to the six-hour admin config cooldown. |
+| `get_dispute_window_secs()` | — | Returns the configured window, defaulting to 14 days. |
+
+The window must be between 1 and `u32::MAX` seconds. Guardians can also change it through a
+`SetDisputeWindow` governance proposal, which requires the configured quorum and
+timelock and bypasses the direct-admin cooldown.
 
 ### Resolution rules
 
@@ -31,19 +37,19 @@ Every successful dispute mutation emits a dedicated event:
 ```text
 topic:   ("dispute_opened", dispute_id)
 payload: DisputeOpenedEvent { dispute_id, subscription_id, subscriber, merchant,
-         amount, evidence_hash, timestamp, schema_version }
+         amount, evidence_hash, timestamp, schema_version, token }
 ```
 
 ```text
 topic:   ("dispute_responded", dispute_id)
 payload: DisputeRespondedEvent { dispute_id, subscription_id, admin_evidence_hash,
-         timestamp, schema_version }
+         timestamp, schema_version, token }
 ```
 
 ```text
 topic:   ("dispute_resolved", dispute_id)
 payload: DisputeResolvedEvent { dispute_id, subscription_id, resolution,
-         timestamp, schema_version }
+         timestamp, schema_version, resolved_to, token }
 ```
 
 ### Security invariants

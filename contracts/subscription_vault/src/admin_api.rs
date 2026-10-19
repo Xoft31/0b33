@@ -34,6 +34,8 @@
 //! | `rotate_merchant_address` | [`crate::merchant::do_rotate_merchant_address`] |
 //! | `set_grace_period` | [`crate::admin::do_set_grace_period`] |
 //! | `get_grace_period` | [`crate::admin::get_grace_period`] |
+//! | `set_dispute_window_secs` | [`crate::admin::do_set_dispute_window_secs`] |
+//! | `get_dispute_window_secs` | [`crate::admin::get_dispute_window_secs`] |
 //! | `set_idempotency_ttl` | [`crate::idempotency::set_ttl_secs`] |
 //! | `get_idempotency_ttl` | [`crate::idempotency::get_ttl_secs`] |
 //!
@@ -161,7 +163,8 @@ pub use crate::admin::{
     do_claim_admin_role, do_get_admin, do_init, do_migrate, do_propose_admin,
     do_recover_stranded_funds, do_rotate_admin, do_set_auto_pause_threshold, do_set_grace_period,
     do_set_min_topup, do_set_subscriber_create_cap, execute_treasury_change, get_admin_proposal,
-    get_auto_pause_threshold, get_fee_token, get_grace_period, get_min_topup,
+    do_set_dispute_window_secs, get_auto_pause_threshold, get_dispute_window_secs, get_fee_token,
+    get_grace_period, get_min_topup,
     get_protocol_fee_bps, get_schema_version, get_subscriber_create_cap, list_accepted_tokens,
     migrate_config_to_persistent, queue_treasury_change, remove_accepted_token, set_fee_token,
     set_protocol_fee,

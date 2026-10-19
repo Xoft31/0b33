@@ -65,6 +65,12 @@ Credit limits are enforced before new liabilities are introduced:
   Deposits increase exposure by the deposit amount. The contract rejects deposits that would
   cause `current_exposure + deposit_amount` to exceed the configured limit.
 
+- **Subscription transfers**
+  - `accept_transfer`
+  The destination subscriber is checked against their aggregate exposure using the transferred
+  subscription's prepaid balance and, when active, its next interval amount. An over-limit
+  transfer is rejected before ownership changes.
+
 Existing subscriptions continue to function (charges, cancellations, withdrawals) even when the
 limit is reached; only new subscriptions and additional prepaid exposure are blocked.
 

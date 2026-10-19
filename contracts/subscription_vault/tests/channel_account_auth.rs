@@ -716,3 +716,267 @@ fn test_replay_used_auth_entry() {
         &deposit_auth,
     );
 }
+
+/// Tests the race condition where the channel account's authorization is
+/// revoked by the subscriber between submission and ledger close.
+///
+/// Expected behavior: once the subscriber revokes the channel account's
+/// authorization (by cancelling the subscription, which removes the
+/// subscriber's delegated authority for that subscription), any subsequent
+/// attempt by the channel account to act on the subscription must fail
+/// with an auth error. This documents that revocation is enforced at
+/// ledger close, not at submission time.
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_revoked_channel_account_mid_transaction() {
+    setup!(
+        env,
+        token,
+        token_admin,
+        admin,
+        subscriber,
+        merchant,
+        vault_id,
+        vault,
+        merchant_client,
+        sub_client,
+        admin_client
+    );
+
+    // 1. Create a subscription via the subscriber's channel account.
+    let amount = 5_000_000i128;
+    let create_args = vec![
+        &env,
+        subscriber.clone().into_val(&env),
+        merchant.clone().into_val(&env),
+        amount.into_val(&env),
+        (30 * 24 * 60 * 60u64).into_val(&env),
+        false.into_val(&env),
+        Option::<i128>::None.into_val(&env),
+        Option::<u64>::None.into_val(&env),
+    ];
+    let create_auth = vec![
+        &env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: vault_id.clone(),
+                fn_name: Symbol::new(&env, "create_subscription"),
+                args: create_args.clone(),
+            },
+            sub_invocations: vec![&env],
+        }),
+    ];
+    let sub_id: u32 = sub_client
+        .exec(
+            &vault_id,
+            &Symbol::new(&env, "create_subscription"),
+            &create_args,
+            &create_auth,
+        )
+        .into_val(&env);
+
+    // 2. Deposit funds so the subscription is active and chargeable.
+    let deposit_amount = 15_000_000i128;
+    let transfer_args = vec![
+        &env,
+        subscriber.clone().into_val(&env),
+        vault_id.clone().into_val(&env),
+        deposit_amount.into_val(&env),
+    ];
+    let token_sub = SubContractInvocation {
+        context: ContractContext {
+            contract: token.address.clone(),
+            fn_name: Symbol::new(&env, "transfer"),
+            args: transfer_args,
+        },
+        sub_invocations: vec![&env],
+    };
+    let deposit_args = vec![
+        &env,
+        sub_id.into_val(&env),
+        subscriber.clone().into_val(&env),
+        deposit_amount.into_val(&env),
+        Option::<soroban_sdk::BytesN<32>>::None.into_val(&env),
+    ];
+    let deposit_auth = vec![&env, InvokerContractAuthEntry::Contract(token_sub)];
+    sub_client.exec(
+        &vault_id,
+        &Symbol::new(&env, "deposit_funds"),
+        &deposit_args,
+        &deposit_auth,
+    );
+
+    // 3. Subscriber revokes the channel account's authorization by
+    //    cancelling the subscription. This simulates the subscriber
+    //    revoking delegated auth between submission and ledger close.
+    let cancel_args = vec![
+        &env,
+        sub_id.into_val(&env),
+        subscriber.clone().into_val(&env),
+    ];
+    let cancel_auth = vec![
+        &env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: vault_id.clone(),
+                fn_name: Symbol::new(&env, "cancel_subscription"),
+                args: cancel_args.clone(),
+            },
+            sub_invocations: vec![&env],
+        }),
+    ];
+    sub_client.exec(
+        &vault_id,
+        &Symbol::new(&env, "cancel_subscription"),
+        &cancel_args,
+        &cancel_auth,
+    );
+
+    // 4. The channel account attempts to charge the now-cancelled
+    //    subscription. This must fail because the subscriber's
+    //    authorization was revoked mid-transaction.
+    env.ledger()
+        .set_timestamp(env.ledger().timestamp() + (30 * 24 * 60 * 60) + 1);
+    let charge_args = vec![
+        &env,
+        sub_id.into_val(&env),
+        Option::<soroban_sdk::BytesN<32>>::None.into_val(&env),
+    ];
+    let charge_auth = vec![
+        &env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: vault_id.clone(),
+                fn_name: Symbol::new(&env, "charge_subscription"),
+                args: charge_args.clone(),
+            },
+            sub_invocations: vec![&env],
+        }),
+    ];
+
+    // This should panic: the subscription is cancelled, so the
+    // channel account's delegated authorization is no longer valid.
+    admin_client.exec(
+        &vault_id,
+        &Symbol::new(&env, "charge_subscription"),
+        &charge_args,
+        &charge_auth,
+    );
+}
+
+/// Tests that a channel account cannot deposit funds into a subscription
+/// after the subscriber has revoked its authorization by cancelling.
+///
+/// This is a companion to `test_revoked_channel_account_mid_transaction`
+/// and documents that revocation applies to all delegated operations,
+/// not just charging.
+#[test]
+#[should_panic(expected = "HostError")]
+fn test_revoked_channel_account_cannot_deposit() {
+    setup!(
+        env,
+        token,
+        token_admin,
+        admin,
+        subscriber,
+        merchant,
+        vault_id,
+        vault,
+        merchant_client,
+        sub_client,
+        admin_client
+    );
+
+    // 1. Create a subscription via the subscriber's channel account.
+    let amount = 5_000_000i128;
+    let create_args = vec![
+        &env,
+        subscriber.clone().into_val(&env),
+        merchant.clone().into_val(&env),
+        amount.into_val(&env),
+        (30 * 24 * 60 * 60u64).into_val(&env),
+        false.into_val(&env),
+        Option::<i128>::None.into_val(&env),
+        Option::<u64>::None.into_val(&env),
+    ];
+    let create_auth = vec![
+        &env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: vault_id.clone(),
+                fn_name: Symbol::new(&env, "create_subscription"),
+                args: create_args.clone(),
+            },
+            sub_invocations: vec![&env],
+        }),
+    ];
+    let sub_id: u32 = sub_client
+        .exec(
+            &vault_id,
+            &Symbol::new(&env, "create_subscription"),
+            &create_args,
+            &create_auth,
+        )
+        .into_val(&env);
+
+    // 2. Subscriber revokes the channel account's authorization by
+    //    cancelling the subscription.
+    let cancel_args = vec![
+        &env,
+        sub_id.into_val(&env),
+        subscriber.clone().into_val(&env),
+    ];
+    let cancel_auth = vec![
+        &env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: vault_id.clone(),
+                fn_name: Symbol::new(&env, "cancel_subscription"),
+                args: cancel_args.clone(),
+            },
+            sub_invocations: vec![&env],
+        }),
+    ];
+    sub_client.exec(
+        &vault_id,
+        &Symbol::new(&env, "cancel_subscription"),
+        &cancel_args,
+        &cancel_auth,
+    );
+
+    // 3. The channel account attempts to deposit into the cancelled
+    //    subscription. This must fail because the subscriber's
+    //    authorization was revoked mid-transaction.
+    let deposit_amount = 15_000_000i128;
+    let transfer_args = vec![
+        &env,
+        subscriber.clone().into_val(&env),
+        vault_id.clone().into_val(&env),
+        deposit_amount.into_val(&env),
+    ];
+    let token_sub = SubContractInvocation {
+        context: ContractContext {
+            contract: token.address.clone(),
+            fn_name: Symbol::new(&env, "transfer"),
+            args: transfer_args,
+        },
+        sub_invocations: vec![&env],
+    };
+    let deposit_args = vec![
+        &env,
+        sub_id.into_val(&env),
+        subscriber.clone().into_val(&env),
+        deposit_amount.into_val(&env),
+        Option::<soroban_sdk::BytesN<32>>::None.into_val(&env),
+    ];
+    let deposit_auth = vec![&env, InvokerContractAuthEntry::Contract(token_sub)];
+
+    // This should panic: the subscription is cancelled, so the
+    // channel account's delegated authorization is no longer valid.
+    sub_client.exec(
+        &vault_id,
+        &Symbol::new(&env, "deposit_funds"),
+        &deposit_args,
+        &deposit_auth,
+    );
+}

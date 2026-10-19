@@ -500,7 +500,7 @@ fn event_emitted_on_success() {
             assert_eq!(evt.timestamp, 1000);
             assert_eq!(
                 evt.schema_version,
-                subscription_vault::EVENT_SCHEMA_VERSION
+                subscription_vault::BASE_EVENT_SCHEMA_VERSION
             );
             found = true;
             break;

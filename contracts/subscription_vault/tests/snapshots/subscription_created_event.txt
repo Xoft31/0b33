@@ -1,4 +1,4 @@
-topic: ("created", <subscription_id>)
+﻿topic: ("created", <subscription_id>)
 data:
   subscription_id: <u32>
   subscriber: <Address>
@@ -9,4 +9,5 @@ data:
   lifetime_cap: <Option<i128>>
   expires_at: <Option<u64>>
   timestamp: <u64>
-  schema_version: 2
+  schema_version: 3
+  contract_id: <Address>

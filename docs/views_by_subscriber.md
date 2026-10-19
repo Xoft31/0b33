@@ -193,5 +193,6 @@ The feature includes comprehensive test coverage in `test_query_performance.rs`:
 ## Related Functions
 
 - **`get_subscription(id)`**: Retrieve full details of a specific subscription by ID.
-- **`get_subscriptions_by_merchant(merchant, start, limit)`**: Offset-based list for a specific merchant.
+- **`get_subscriptions_by_merchant(merchant, start, limit, reverse)`**: Offset-based list for a specific merchant; `reverse = true` returns newest-first.
+- **`list_subscriptions_by_merchant(merchant, cursor, limit, reverse)`**: Cursor-based variant of the same list.
 - **`get_next_charge_info(id)`**: Next billing timestamp for a subscription.

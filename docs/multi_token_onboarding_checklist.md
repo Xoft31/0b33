@@ -517,7 +517,7 @@ involving the new token.
 
 ### 8.1 Verify event schema compatibility
 
-All events carry a `schema_version` field (currently `2`). Confirm the indexer
+All events carry a `schema_version` field (currently `6`). Confirm the indexer
 can decode:
 
 - `SubscriptionCreatedEvent.token` — now points to the new token address.

@@ -103,6 +103,48 @@ fn test_claim_after_window_elapsed_succeeds() {
 }
 
 #[test]
+fn test_cancellation_escrow_survives_configured_ttl_window() {
+    let test_env = TestEnv::default();
+    let created_seq = 100;
+    let ttl = crate::types::SUB_TTL_EXTEND_TO;
+    test_env.env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = created_seq;
+        ledger.min_persistent_entry_ttl = 4_096;
+        ledger.min_temp_entry_ttl = 4_096;
+        ledger.max_entry_ttl = ttl + 5_000_000;
+    });
+
+    let (id, subscriber, _) = fixtures::create_subscription(
+        &test_env.env,
+        &test_env.client,
+        SubscriptionStatus::Active,
+    );
+    test_env.stellar_token_client().mint(&subscriber, &PREPAID);
+    test_env
+        .client
+        .deposit_funds(&id, &PREPAID, &None::<soroban_sdk::BytesN<32>>);
+    test_env.client.cancel_subscription(&id, &subscriber);
+
+    let contract_id = test_env.client.address.clone();
+    let instance_ttl = ttl + 4_000_000;
+    test_env.env.as_contract(&contract_id, || {
+        test_env
+            .env
+            .storage()
+            .instance()
+            .extend_ttl(instance_ttl, instance_ttl);
+    });
+    test_env
+        .env
+        .ledger()
+        .with_mut(|ledger| ledger.sequence_number = created_seq + ttl);
+
+    let escrow = test_env.client.get_cancellation_escrow(&id);
+    assert_eq!(escrow.subscriber, subscriber);
+    assert_eq!(escrow.amount, PREPAID);
+}
+
+#[test]
 fn test_cancellation_escrow_released_event() {
     let (test_env, id, subscriber, _) = setup_cancelled_with_balance();
 

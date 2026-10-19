@@ -52,6 +52,7 @@ pub fn charge_usage(
 | Subscription exists  | `NotFound`                 | The given ID must reference a stored subscription.     |
 | Status is `Active`   | `NotActive`                | Paused, cancelled, or insufficient-balance subs are rejected. |
 | `usage_enabled`      | `UsageNotEnabled`          | The subscription must have been created with usage enabled. |
+| Auto-renewal disabled and current interval elapsed | `NotActive` | Usage charges stop at the next interval boundary after auto-renewal is disabled. |
 | `usage_amount > 0`   | `InvalidAmount`            | Zero or negative amounts are rejected.                 |
 | Balance sufficient   | `InsufficientPrepaidBalance` | `prepaid_balance` must be ≥ `usage_amount`.           |
 

@@ -195,14 +195,14 @@ fn view_get_subscriptions_by_merchant_while_stopped() {
     client.enable_emergency_stop(&admin);
 
     let page = client
-        .get_subscriptions_by_merchant(&merchant, &0u32, &10u32)
+        .get_subscriptions_by_merchant(&merchant, &0u32, &10u32, &false)
         .expect("get_subscriptions_by_merchant failed");
     assert_eq!(page.len(), 1u32);
     assert_eq!(page.get(0).unwrap().amount, AMOUNT);
     let _ = sub_id; // used via the page check
 }
 
-/// `get_subscriptions_by_token` must return subscription slice while stopped.
+/// Token subscription queries must remain available while stopped.
 #[test]
 fn view_get_subscriptions_by_token_while_stopped() {
     let (_env, client, token, admin, _subscriber, _merchant, _sub_id) = setup_full();
@@ -212,6 +212,13 @@ fn view_get_subscriptions_by_token_while_stopped() {
         .get_subscriptions_by_token(&token, &0u32, &10u32)
         .expect("get_subscriptions_by_token failed");
     assert_eq!(page.len(), 1u32);
+
+    let cursor_page = client
+        .list_subscriptions_by_token(&token, &None::<u32>, &10u32)
+        .expect("list_subscriptions_by_token failed");
+    assert_eq!(cursor_page.subscriptions.len(), 1u32);
+    assert_eq!(cursor_page.total, 1u32);
+    assert_eq!(cursor_page.next_cursor, None);
 }
 
 /// `list_subscriptions_by_subscriber` must return IDs while stopped.
@@ -325,7 +332,7 @@ fn view_get_subscriptions_by_merchant_empty_state() {
     let (env, client, _token, _admin) = setup_empty();
     let merchant = Address::generate(&env);
     let page = client
-        .get_subscriptions_by_merchant(&merchant, &0u32, &10u32)
+        .get_subscriptions_by_merchant(&merchant, &0u32, &10u32, &false)
         .expect("should return Ok with empty list");
     assert_eq!(page.len(), 0u32);
 }
@@ -339,6 +346,13 @@ fn view_get_subscriptions_by_token_empty_state() {
         .get_subscriptions_by_token(&token, &0u32, &10u32)
         .expect("should return Ok with empty list");
     assert_eq!(page.len(), 0u32);
+
+    let cursor_page = client
+        .list_subscriptions_by_token(&token, &None::<u32>, &10u32)
+        .expect("should return Ok with empty page");
+    assert!(cursor_page.subscriptions.is_empty());
+    assert_eq!(cursor_page.total, 0u32);
+    assert_eq!(cursor_page.next_cursor, None);
 }
 
 /// `list_subscriptions_by_subscriber` on empty state returns empty page.

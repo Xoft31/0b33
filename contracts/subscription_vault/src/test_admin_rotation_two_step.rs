@@ -103,13 +103,40 @@ fn test_propose_admin_event_emitted() {
 }
 
 #[test]
-fn test_propose_admin_during_emergency_stop() {
+fn test_propose_admin_blocked_during_emergency_stop() {
     let (env, client, _token, admin) = setup();
     client.enable_emergency_stop(&admin);
     let new_admin = Address::generate(&env);
 
+    let result = client.try_propose_admin(&admin, &new_admin);
+    assert_eq!(result, Err(Ok(Error::EmergencyStopActive)));
+    assert!(client.get_admin_proposal().is_none());
+}
+
+#[test]
+fn test_claim_admin_role_blocked_during_emergency_stop() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+
     client.propose_admin(&admin, &new_admin);
-    assert!(client.get_admin_proposal().is_some());
+    advance_seconds(&env, 24 * 60 * 60);
+    client.enable_emergency_stop(&admin);
+
+    let result = client.try_claim_admin_role(&new_admin);
+    assert_eq!(result, Err(Ok(Error::EmergencyStopActive)));
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.get_admin_proposal().unwrap().new_admin, new_admin);
+}
+
+#[test]
+fn test_rotate_admin_blocked_during_emergency_stop() {
+    let (env, client, _token, admin) = setup();
+    let new_admin = Address::generate(&env);
+    client.enable_emergency_stop(&admin);
+
+    let result = client.try_rotate_admin(&admin, &new_admin, &0u64);
+    assert_eq!(result, Err(Ok(Error::EmergencyStopActive)));
+    assert_eq!(client.get_admin(), admin);
 }
 
 // ── claim_admin_role ─────────────────────────────────────────────────────────

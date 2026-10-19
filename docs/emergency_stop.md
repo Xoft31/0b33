@@ -23,6 +23,7 @@ The following operations remain available during an active emergency stop to ens
 | `pause_subscription` / `resume_subscription` | State management; no fund movement |
 | `withdraw_subscriber_funds` | Subscribers can reclaim prepaid balance from cancelled subscriptions |
 | `withdraw_merchant_funds` / `withdraw_merchant_token_funds` | Merchants can collect already-earned balances |
+| `cancel_admin_proposal` | The current admin can revoke a pending transfer; completing or starting a rotation is blocked |
 
 This ensures that even under a prolonged emergency stop, no party is permanently locked out of their funds.
 

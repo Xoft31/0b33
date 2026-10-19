@@ -1,5 +1,5 @@
 use crate::admin::require_admin_auth;
-use crate::types::{DataKey, Dispute, DisputeStatus, Error};
+use crate::types::{DataKey, Dispute, DisputeStatus, Error, SubscriptionStatus};
 use soroban_sdk::{contracttype, Address, Env, String, Symbol, Vec};
 
 #[contracttype]
@@ -15,6 +15,7 @@ pub struct BlocklistAddedEvent {
     pub reason: String,
     /// Event schema version for backwards-compatible indexer decoding.
     pub schema_version: u32,
+    pub contract_id: Address,
 }
 
 #[contracttype]
@@ -23,6 +24,7 @@ pub struct BlocklistRemovedEvent {
     pub subscriber: Address,
     /// Event schema version for backwards-compatible indexer decoding.
     pub schema_version: u32,
+    pub contract_id: Address,
 }
 
 pub fn is_blocklisted(env: &Env, addr: &Address) -> bool {
@@ -71,7 +73,8 @@ pub fn do_add_to_blocklist(
         BlocklistAddedEvent {
             subscriber,
             reason: reason_str,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -112,15 +115,42 @@ pub fn do_remove_from_blocklist(
         }
     }
 
+    // Removing a blocklist entry restores the normal subscription lifecycle.
+    // Capture the index before changing the blocklist, then resume only the
+    // subscriptions that were explicitly paused (grace/insufficient states
+    // must retain their billing semantics).
+    let subscriber_subscriptions = env
+        .storage()
+        .instance()
+        .get::<_, Vec<u32>>(&subs_key)
+        .unwrap_or_else(|| Vec::new(env));
+
     env.storage()
         .persistent()
         .remove(&DataKey::Blocklist(subscriber.clone()));
+
+    for sub_id in subscriber_subscriptions.iter() {
+        if let Some(sub) = env
+            .storage()
+            .persistent()
+            .get::<_, crate::types::Subscription>(&DataKey::Sub(sub_id))
+        {
+            if sub.status == SubscriptionStatus::Paused {
+                crate::subscription::resume_after_blocklist_removal(
+                    env,
+                    sub_id,
+                    admin.clone(),
+                )?;
+            }
+        }
+    }
 
     env.events().publish(
         (Symbol::new(env, "blocklist_removed"), subscriber.clone()),
         BlocklistRemovedEvent {
             subscriber,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 

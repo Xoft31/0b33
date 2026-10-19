@@ -1,6 +1,6 @@
 use crate::{
     idempotency::{
-        check_key, check_key_at, hash_idem_key, push_key, IdemRingBuffer, IDEM_HISTORY,
+        check_key, check_key_at, hash_idem_key, IdemRingBuffer, IDEM_HISTORY,
         IDEM_TTL_SECS,
     },
     ChargeExecutionResult, SubscriptionVault, SubscriptionVaultClient,
@@ -257,17 +257,16 @@ fn test_ring_buffer_evicts_oldest_key() {
     );
 }
 
-/// Idempotency ring-buffer wraparound test.
+/// Ring-buffer capacity and TTL-driven pruning test.
 ///
-/// Feeds `IDEM_HISTORY + 3` unique hashes through `deposit_funds` and
-/// validates:
+/// Validates that:
 ///
-/// * The freshest hash is still rejected (idempotent no-op).
-/// * The oldest hash that was evicted can be replayed as a fresh deposit.
-/// * Buffer eviction order matches the circular overwrite documentation:
-///   after filling the buffer, each new entry overwrites the oldest slot
-///   and advances the cursor.
-/// * Inserting a duplicate hash within the live window is a no-op.
+/// * Keys within the TTL window are rejected (idempotent no-ops).
+/// * When all `IDEM_HISTORY` slots are live, a new unique key is rejected
+///   with `IdemBufferFull` rather than silently evicting the oldest live slot.
+/// * After advancing past `IDEM_TTL_SECS`, expired entries are pruned on the
+///   next write and new keys are accepted again.
+/// * Duplicate insertions within the live window remain idempotent.
 #[test]
 fn test_idem_ring_wraparound_preserves_rejection_semantics() {
     let (env, client, token) = setup_test_env();
@@ -281,11 +280,10 @@ fn test_idem_ring_wraparound_preserves_rejection_semantics() {
     let subscription_id = id;
 
     let extra_per = 500_000i128;
-    let total_inserts = IDEM_HISTORY + 3;
     let mut seen_hashes: Vec<BytesN<32>> = soroban_sdk::Vec::new(&env);
 
-    // ── Phase 1: fill the buffer past capacity ──────────────────────
-    for i in 0..total_inserts {
+    // ── Phase 1: fill the buffer to exactly IDEM_HISTORY ────────────
+    for i in 0..IDEM_HISTORY {
         let raw = make_key(&env, i as u8);
         let hashed = hash_idem_key(&env, domain, subscription_id, &raw);
         seen_hashes.push_back(hashed.clone());
@@ -293,9 +291,8 @@ fn test_idem_ring_wraparound_preserves_rejection_semantics() {
         token_admin.mint(&subscriber, &extra_per);
         let bal_before = client.get_subscription(&id).prepaid_balance;
         let r = client.deposit_funds(&id, &extra_per, &Some(raw));
-        assert_eq!(r, ChargeExecutionResult::Charged);
+        assert_eq!(r, ChargeExecutionResult::Charged, "insert {i}: must succeed");
 
-        // Every insert while the hash is new must increase the balance.
         let bal_after = client.get_subscription(&id).prepaid_balance;
         assert_eq!(
             bal_after,
@@ -304,9 +301,19 @@ fn test_idem_ring_wraparound_preserves_rejection_semantics() {
         );
     }
 
-    // ── Phase 2: freshest hash must still be rejected ───────────────
-    let freshest_hash = seen_hashes.get(total_inserts - 1).unwrap();
-    let freshest_raw = make_key(&env, (total_inserts - 1) as u8);
+    // ── Phase 2: overflow must return IdemBufferFull (no eviction) ──
+    let overflow_raw = make_key(&env, 0xFF);
+    token_admin.mint(&subscriber, &extra_per);
+    let result = client.try_deposit_funds(&id, &extra_per, &Some(overflow_raw));
+    assert_eq!(
+        result,
+        Err(Ok(crate::Error::IdemBufferFull)),
+        "65th unique key with all slots live must return IdemBufferFull"
+    );
+
+    // ── Phase 3: freshest hash must still be rejected (idempotent) ──
+    let freshest_hash = seen_hashes.get(IDEM_HISTORY - 1).unwrap();
+    let freshest_raw = make_key(&env, (IDEM_HISTORY - 1) as u8);
     let bal_before = client.get_subscription(&id).prepaid_balance;
     client.deposit_funds(&id, &extra_per, &Some(freshest_raw));
     let bal_after = client.get_subscription(&id).prepaid_balance;
@@ -314,40 +321,13 @@ fn test_idem_ring_wraparound_preserves_rejection_semantics() {
         bal_before, bal_after,
         "freshest hash must be rejected (idempotent)"
     );
-
-    // Also verify via the low-level check_key helper.
     assert!(
         check_key(&env, subscription_id, &freshest_hash),
         "check_key must recognise the freshest hash"
     );
 
-    // ── Phase 3: oldest evicted hash can be replayed ────────────────
-    // The buffer holds only IDEM_HISTORY entries.  The first 3 hashes
-    // (indices 0, 1, 2) were overwritten by the last 3 insertions
-    // (indices IDEM_HISTORY, IDEM_HISTORY+1, IDEM_HISTORY+2).
-    let evicted_indices = [0u8, 1, 2];
-    for &idx in &evicted_indices {
-        let raw = make_key(&env, idx);
-        let hashed = hash_idem_key(&env, domain, subscription_id, &raw);
-        assert!(
-            !check_key(&env, subscription_id, &hashed),
-            "evicted hash {idx} must NOT be in the ring"
-        );
-
-        let bal_before = client.get_subscription(&id).prepaid_balance;
-        token_admin.mint(&subscriber, &extra_per);
-        client.deposit_funds(&id, &extra_per, &Some(raw));
-        let bal_after = client.get_subscription(&id).prepaid_balance;
-        assert_eq!(
-            bal_after,
-            bal_before + extra_per,
-            "replay of evicted hash {idx} must be treated as fresh"
-        );
-    }
-
-    // ── Phase 4: still-live hashes inside the ring remain rejected ──
-    // Indices 3..=IDEM_HISTORY-1 were never evicted.
-    for idx in 3..IDEM_HISTORY {
+    // ── Phase 4: all slots remain live — every key still rejected ───
+    for idx in 0..IDEM_HISTORY {
         let raw = make_key(&env, idx as u8);
         let hashed = hash_idem_key(&env, domain, subscription_id, &raw);
         assert!(
@@ -364,15 +344,20 @@ fn test_idem_ring_wraparound_preserves_rejection_semantics() {
         );
     }
 
-    // ── Phase 5: duplicate insertion within live window is no-op ─────
-    let dup_idx = IDEM_HISTORY + 1;
-    let dup_raw = make_key(&env, dup_idx as u8);
+    // ── Phase 5: after TTL expiry, new keys are accepted ────────────
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + IDEM_TTL_SECS);
+
+    // The overflow key should now be accepted (all prior entries expired).
+    let overflow_raw2 = make_key(&env, 0xFE);
+    token_admin.mint(&subscriber, &extra_per);
     let bal_before = client.get_subscription(&id).prepaid_balance;
-    client.deposit_funds(&id, &extra_per, &Some(dup_raw));
-    let bal_after = client.get_subscription(&id).prepaid_balance;
+    let r = client.deposit_funds(&id, &extra_per, &Some(overflow_raw2));
+    assert_eq!(r, ChargeExecutionResult::Charged, "key accepted after TTL expiry");
     assert_eq!(
-        bal_before, bal_after,
-        "duplicate of live hash {dup_idx} must be rejected"
+        client.get_subscription(&id).prepaid_balance,
+        bal_before + extra_per,
+        "balance must increase after TTL expiry"
     );
 }
 
@@ -695,5 +680,87 @@ fn test_charge_and_recovery_keys_are_namespace_separated() {
         replay_result,
         Err(Ok(crate::Error::Replay)),
         "replaying the same recovery_id must return Error::Replay"
+    );
+}
+
+/// When the idempotency ring is full of **live** entries (none have expired),
+/// inserting a new unique key must be rejected with [`Error::IdemBufferFull`]
+/// instead of silently evicting the oldest live slot.
+///
+/// ## What is being tested
+///
+/// 1. Fill the ring to exactly `IDEM_HISTORY` unique deposits, all within the
+///    TTL window so no slot is eligible for pruning.
+/// 2. Attempt one more deposit with a fresh key — the contract must return
+///    `Error::IdemBufferFull`.
+/// 3. Verify that every previously inserted key is still in the ring (no
+///    silent eviction occurred).
+/// 4. Advance time past `IDEM_TTL_SECS` so all entries expire, then confirm
+///    the same fresh key is accepted and the balance increases.
+#[test]
+fn test_idem_buffer_full_error_when_all_slots_live() {
+    let (env, client, token) = setup_test_env();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let id = create_and_fund_sub(&env, &client, &subscriber, &merchant, &token);
+    let token_admin = token::StellarAssetClient::new(&env, &token);
+    token_admin.mint(&subscriber, &1_000_000_000i128);
+
+    let domain: u32 = 0; // deposit_funds domain
+    let extra: i128 = 500_000;
+
+    // ── Phase 1: fill every slot with a live key ─────────────────────────────
+    for i in 0..IDEM_HISTORY {
+        let raw = make_key(&env, i as u8);
+        token_admin.mint(&subscriber, &extra);
+        let r = client.deposit_funds(&id, &extra, &Some(raw));
+        assert_eq!(r, ChargeExecutionResult::Charged, "insert {i}: must succeed");
+    }
+
+    // ── Phase 2: one more unique key must return IdemBufferFull ──────────────
+    let overflow_raw = make_key(&env, 0xFF);
+    token_admin.mint(&subscriber, &extra);
+    let balance_before = client.get_subscription(&id).prepaid_balance;
+
+    let result = client.try_deposit_funds(&id, &extra, &Some(overflow_raw.clone()));
+    assert_eq!(
+        result,
+        Err(Ok(crate::Error::IdemBufferFull)),
+        "a 65th unique key with all slots live must return IdemBufferFull"
+    );
+
+    // Balance must be unchanged — the deposit was rejected.
+    assert_eq!(
+        client.get_subscription(&id).prepaid_balance,
+        balance_before,
+        "balance must not change when IdemBufferFull is returned"
+    );
+
+    // ── Phase 3: all original slots must still be present (no eviction) ──────
+    for i in 0..IDEM_HISTORY {
+        let raw = make_key(&env, i as u8);
+        let hashed = hash_idem_key(&env, domain, id, &raw);
+        assert!(
+            check_key(&env, id, &hashed),
+            "slot {i} must still be live after the failed overflow insert"
+        );
+    }
+
+    // ── Phase 4: after TTL expiry the fresh key must be accepted ─────────────
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + IDEM_TTL_SECS);
+
+    token_admin.mint(&subscriber, &extra);
+    let balance_before = client.get_subscription(&id).prepaid_balance;
+    let r = client.deposit_funds(&id, &extra, &Some(overflow_raw));
+    assert_eq!(
+        r,
+        ChargeExecutionResult::Charged,
+        "fresh key must be accepted once all prior entries have expired"
+    );
+    assert_eq!(
+        client.get_subscription(&id).prepaid_balance,
+        balance_before + extra,
+        "balance must increase after the expired-then-accepted deposit"
     );
 }

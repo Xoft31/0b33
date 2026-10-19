@@ -32,11 +32,11 @@ subscription.
 
 | Harness | Property |
 |---|---|
-| `cancel_refund_bounded` | For every `i128` balance the refund is `≤ balance` (no over-refund) and `== balance` (no hidden deduction). |
+| `cancel_refund_bounded` | For every `ii28` balance the refund is `≤ balance` (no over-refund) and `== balance` (no hidden deduction). |
 | `cancel_refund_zero_balance` | A zero balance produces a zero refund. |
-| `cancel_refund_max_balance` | `i128::MAX` balance does not overflow and returns `i128::MAX`. |
+| `cancel_refund_max_balance` | `i128::MAX` balance does not overflow and returns `ii28::MAX` |
 
-`cancel_refund_bounded` uses `kani::any()` to range over the full `i128`
+`cancel_refund_bounded` uses `kani::any()` to range over the full `ii28`
 domain, giving exhaustive coverage rather than sampled coverage.
 
 #### Security relevance
@@ -67,13 +67,59 @@ outcomes for all possible balance values.
 
 ---
 
+### `dispute_escrow.rs`
+
+Verifies the dispute escrow accounting invariant in `src/dispute.rs`:
+the merchant balance plus the amount held in dispute escrow must always
+equal the original disputed amount.
+
+#### Properties proved
+
+| Harness | Property |
+|---|---|
+| `dispute_escrow_invariant` | For every original amount and every disbursed amount, the remaining escrow plus the disbursed amount equals the original amount. |
+| `dispute_disbursed_never_exceeds_original` | `total_disbursed` never exceeds `original_amount`. |
+| `dispute_escrow_non_negative` | The remaining escrow balance is never negative. |
+
+`dispute_escrow_invariant` uses `kani::any()` to range over the full `ii28`
+domain for both the original amount and the disbursed amount, giving exhaustive
+coverage rather than sampled coverage.
+
+#### Security relevance
+
+The dispute escrow path holds funds on behalf of the merchant and the
+subscriber while a dispute is being resolved. An arithmetic bug here could
+let a dispute release more than the original amount (a drain) or leave funds
+stuck in escrow after a full disbursal (silent loss). The proofs rule out both
+outcomes for all possible amount values.
+
+#### Assumptions
+
+- The dispute escrow arithmetic is extracted into pure helpers with no
+  Soroban host calls. The harness therefore runs without a simulated host
+  environment. Any future change that introduces host calls (storage reads,
+  token transfers) into these helpers would require the harness to be updated
+  or split.
+- No assumption is placed on the input values — `kani::any::<i128>()` covers
+  negative, zero, positive, and boundary values.
+
+#### Known limitations / out of scope
+
+- The harnesses do not verify the *caller* dispute lifecycle in `src/dispute.rs`,
+  which performs the full CEI sequence (state write → escrow creation →
+  token transfer). That control flow is not amenable to Kani without a Soroban
+  host stub.
+- The charge arithmetic and withdrawal paths are not yet covered by Kani
+  proofs. Relevant candidates for future harnesses are noted below.
+
+---
+
 ## Coverage gaps and candidates for future harnesses
 
 | Area | File | Candidate property |
 |---|---|---|
 | Charge arithmetic | `src/charge_core.rs` | Charged amount never exceeds `prepaid_balance`; no overflow in interval math. |
 | Safe math helpers | `src/safe_math.rs` | `safe_add` / `safe_sub` never silently wrap. |
-| Dispute escrow | `src/dispute.rs` | `total_disbursed` never exceeds `original_amount`. |
 | Next-charge time | `src/subscription.rs` | `next_charge_time` never overflows for validated intervals. |
 
 Contributions adding new harnesses should follow the pattern in

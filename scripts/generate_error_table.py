@@ -111,6 +111,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "NotInGracePeriod":               ("Refresh state; a grace-period buyout is only legal when status == GracePeriod.", "—", False),
     "TimelockNotElapsed":             ("Wait until the scheduled effective timestamp; this is a timelock, not an error condition.", "TreasuryChangeScheduledEvent", False),
     "VacationActive":                 ("Retry after the merchant vacation window ends or the merchant calls unpause_merchant.", "MerchantUnpausedEvent", False),
+    "UsageLimitsRequired":            ("Call configure_usage_limits for this subscription before charging usage.", "UsageLimitsConfiguredEvent", False),
     "EmergencyWithdrawInvalidState":  ("Refresh subscription state; emergency withdraw is only valid from the states the policy allows.", "—", False),
     # Accounting
     "InsufficientBalance":            ("Retry only after subscriber deposits funds via deposit_funds.", "FundsDepositedEvent", False),
@@ -123,6 +124,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "OraclePriceStale":               ("Retry only after a fresh oracle quote is published.", "OracleChargeResolvedEvent", False),
     "OracleDeviationTooHigh":         ("Treat as terminal; the oracle price deviated past the circuit-breaker threshold. Investigate the price feed before retrying.", "OracleChargeResolvedEvent", False),
     "ProtocolFeeTooHigh":            ("Fix protocol_fee_bps to be at most MAX_PROTOCOL_FEE_BIPS.", "ProtocolFeeUpdatedEvent", False),
+    "SelfReferralNotAllowed":        ("Use a different inviter address; an account cannot refer itself.", "—", False),
     # Limits
     "SubscriptionLimitReached":       ("Treat as terminal capacity failure; no new subscriptions can be created.", "—", False),
     "LifetimeCapReached":             ("Stop charging; surface terminal state to user.", "LifetimeCapReachedEvent", False),
@@ -134,6 +136,8 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "RateLimitExceeded":              ("Retry after the rate window resets (see configure_usage_limits).", "UsageLimitsConfiguredEvent", False),
     "UsageCapExceeded":               ("Retry only after new billing period begins or cap is raised.", "UsageLimitsConfiguredEvent", False),
     "BurstLimitExceeded":             ("Retry after burst_min_interval_secs elapses.", "UsageLimitsConfiguredEvent", False),
+    "SubscriberRateLimited":         ("Retry after the subscriber creation rate window resets; check get_subscriber_create_window.", "—", False),
+    "IdemBufferFull":                 ("All 64 idempotency slots are occupied by live (non-expired) entries. Wait until the oldest entry's TTL elapses (up to 7 days from its insertion timestamp) before retrying. Under normal billing cadences this error cannot occur; if seen, investigate abnormally high charge frequency on this subscription.", "—", False),
     # Merchant config
     "InvalidFeeBips":                 ("Fix fee_bips to be in range [0, 10000].", "MerchantConfigUpdatedEvent", False),
     "InvalidOperations":              ("Fix allowed_operations bitmap to use only valid OP_* bits.", "MerchantConfigUpdatedEvent", False),
@@ -150,6 +154,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     # Schema migration
     "SchemaMigrationDowngrade":       ("Downgrade rejected; deploy the correct binary version.", "SchemaMigratedEvent", False),
     "SchemaVersionMismatch":          ("Migration rejected; deploy compatible binary.", "—", False),
+    "SchemaMigrationVerificationFailed": ("Treat as terminal; investigate migrated storage before retrying.", "—", False),
     # Dispute / Chargeback
     "DisputeNotFound":                ("Verify dispute ID before retrying.", "—", False),
     "DisputeAlreadyResolved":         ("Inspect existing resolution; do not retry.", "DisputeResolvedEvent", False),
@@ -159,6 +164,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "DisputeAlreadyResponded":        ("Dispute is not in `Open` status; cannot respond twice.", "DisputeRespondedEvent", False),
     "DisputeOverpay":                  ("Fix the resolution split so total disbursed does not exceed the escrowed amount.", "DisputeResolvedEvent", False),
     "SubscriberHasOpenDisputes":      ("Resolve the subscriber's open disputes before requesting blocklist removal.", "DisputeResolvedEvent", False),
+    "DisputeAmountExceedsMerchantBalance": ("Fix the dispute resolution amount; merchant balance is insufficient to cover the payout.", "DisputeResolvedEvent", False),
     # Subscription transfer (11000-11099)
     "TransferIntentNotFound":         ("Verify transfer initiation or expiry before retrying.", "—", False),
     "TransferIntentExpired":          ("Transfer intent has expired; initiate a new transfer.", "—", False),
@@ -182,6 +188,7 @@ REMEDIATION: dict[str, tuple[str, str, bool]] = {
     "ProposalAlreadyExists":          ("Cancel the active proposal with cancel_admin_proposal before proposing a different admin.", "AdminProposalCancelledEvent", False),
     "NoActiveProposal":               ("There is no active proposal to cancel; nothing to roll back.", "—", False),
     "ProposalCooldownActive":         ("Wait for the admin proposal cooldown to elapse before proposing again.", "—", False),
+        "ProposalInvalidated":            ("Submit a new proposal after the admin rotation; pre-rotation proposals cannot be reused.", "—", False),
     # Multi-sig (15000-15099)
     "MultiSigApprovalRequired":       ("This operation needs multi-sig approval; submit a proposal and gather the required signatures first.", "MultiSigProposalCreatedEvent", False),
     "MultiSigProposalNotFound":       ("No valid multi-sig proposal matches this operation; create one first.", "MultiSigProposalCreatedEvent", False),

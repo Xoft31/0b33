@@ -8,6 +8,30 @@ This document is the single source of truth for the formal invariants enforced b
 - the **tests** that prove it, and
 - any **known assumptions or limitations**.
 
+The enforcement classifications used below are:
+
+| Enforcement | Meaning |
+|-------------|---------|
+| **On-chain** | Contract logic rejects invalid state or inputs before committing a mutation. |
+| **Off-chain** | An indexer or monitoring process detects violations without an equivalent contract guard. |
+| **Mixed** | The contract enforces part of the property while an off-chain process checks the remainder. |
+| **Unverified** | The repository does not provide enough evidence to establish the enforcement mechanism. |
+
+| Invariant | Enforcement | Evidence in this repository |
+|-----------|-------------|----------------------------|
+| INV-1 — No Double-Charge per Interval | **On-chain** | `charge_subscription` / `charge_one` enforce the interval guard, and replay keys are checked in contract storage before charging. |
+| INV-2 — Accounted Balances Never Go Negative | **On-chain** | `safe_add` and `safe_sub` reject overflow and underflow before balance writes. |
+| INV-3 — Withdrawals Are Limited to Owned Balances | **On-chain** | Withdrawal entrypoints authenticate the owner and validate the stored balance and subscription state before transfer. |
+| INV-4 — Emergency Stop Halts All State-Changing Operations | **On-chain** | Mutating entrypoints check the stored emergency-stop flag before state changes. |
+| INV-5 — Reentrancy: State Is Committed Before External Token Transfers | **On-chain** | Contract execution applies storage effects before `token.transfer()` under the documented Soroban execution model. |
+| INV-6 — Subscription Lifecycle: Cancelled Is a Terminal State | **On-chain** | `validate_status_transition` rejects transitions out of `Cancelled` before mutation. |
+| INV-7 — Authorization: Only the Admin May Execute Privileged Operations | **On-chain** | Privileged entrypoints use the stored admin address and Soroban authorization checks. |
+
+No invariant currently documented in this file is classified as **Off-chain**, **Mixed**, or
+**Unverified**. The assumptions and limitations below describe conditions that may require
+off-chain monitoring or future review, but they are not substitutes for the contract guards
+listed in the enforcement table.
+
 Related background documentation: `docs/security.md`, `docs/reentrancy.md`,
 `docs/subscription_state_machine.md`, `docs/safe_math.md`, `docs/replay_protection.md`.
 

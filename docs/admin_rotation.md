@@ -244,20 +244,21 @@ Properties that matter for an incident:
 gone — see [Rollback after acceptance](#rollback-after-acceptance) below.
 **Cancel early.** Treat the cooldown as the deadline, not the 7-day expiry.
 
-### Emergency use of `rotate_admin`
+### Emergency stop interaction
 
-Because `rotate_admin` is not nonce-gated in the way `propose_admin` is and
-takes effect in a single transaction, it remains the right tool when:
+All admin-transfer paths (`rotate_admin`, `propose_admin`, and
+`claim_admin_role`) return `Error::EmergencyStopActive` while the emergency
+stop is active. This prevents a pending or newly created transfer from
+changing administrative control during an incident. The current admin may
+still call `cancel_admin_proposal` to revoke a pending transfer.
 
-- The current admin is being replaced urgently and a 24-hour wait is not
-  acceptable, **or**
-- The stored admin is a contract/governance address that a human cannot drive
-  interactively.
+After the incident is resolved and the stop has been disabled, use
+`rotate_admin` when an immediate handoff is necessary or the stored admin is a
+contract/governance address that cannot use the two-step flow.
 
 `rotate_admin` **is** nonce-gated (`DOMAIN_ADMIN_ROTATION`, read with
 `get_admin_nonce(current_admin, 1)`), so query the nonce immediately before
-signing. It is also not gated by the emergency stop — see
-[Emergency Stop Interaction](#emergency-stop-interaction).
+signing.
 
 ### Rollback after acceptance
 
@@ -298,12 +299,6 @@ error-code table, see [`runbooks/admin_rotation.md`](runbooks/admin_rotation.md)
 | `batch_charge` | ✓ (via stored auth) | ✗ | ✗ |
 | `charge_subscription` | ✓ (via stored auth) | ✗ | ✗ |
 | `charge_usage` | ✓ (via stored auth) | ✗ | ✗ |
-
-### Emergency Stop Interaction
-
-`rotate_admin` is **not** gated by the emergency stop. This is intentional:
-rotation is the primary mechanism for handing off control during an incident.
-After rotation, the new admin can `disable_emergency_stop` to resume operations.
 
 ## Security Notes
 

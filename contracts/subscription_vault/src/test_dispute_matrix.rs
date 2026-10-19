@@ -8,6 +8,12 @@ use soroban_sdk::{testutils::Events, FromVal, Symbol};
 
 const DISPUTE_AMOUNT: i128 = 5_000_000;
 
+#[derive(Clone, Copy, Debug)]
+enum DisputeOrigin {
+    SubscriberOpened,
+    CancellationEscrow,
+}
+
 #[derive(Clone, Copy)]
 enum Action {
     Respond,
@@ -15,27 +21,49 @@ enum Action {
     ResolveToSubscriber,
 }
 
-fn open_dispute(test_env: &TestEnv) -> (u64, u32) {
-    let (subscription_id, subscriber, _) =
+fn open_dispute(test_env: &TestEnv, origin: DisputeOrigin) -> (u64, u32) {
+    let (subscription_id, subscriber, merchant) =
         fixtures::create_subscription(&test_env.env, &test_env.client, SubscriptionStatus::Active);
     let subscription = test_env.client.get_subscription(&subscription_id);
 
-    test_env.env.as_contract(&test_env.client.address, || {
-        test_env.env.storage().instance().set(
-            &DataKey::MerchantBalance(subscription.merchant.clone(), subscription.token.clone()),
-            &DISPUTE_AMOUNT,
-        );
-    });
-    test_env
-        .stellar_token_client()
-        .mint(&test_env.client.address, &DISPUTE_AMOUNT);
-
-    let dispute_id = test_env.client.open_dispute(
-        &subscriber,
-        &subscription_id,
-        &DISPUTE_AMOUNT,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
+    let dispute_id = match origin {
+        DisputeOrigin::SubscriberOpened => {
+            test_env.env.as_contract(&test_env.client.address, || {
+                test_env.env.storage().instance().set(
+                    &DataKey::MerchantBalance(
+                        subscription.merchant.clone(),
+                        subscription.token.clone(),
+                    ),
+                    &DISPUTE_AMOUNT,
+                );
+            });
+            test_env
+                .stellar_token_client()
+                .mint(&test_env.client.address, &DISPUTE_AMOUNT);
+            test_env.client.open_dispute(
+                &subscriber,
+                &subscription_id,
+                &DISPUTE_AMOUNT,
+                &None::<soroban_sdk::BytesN<32>>,
+            )
+        }
+        DisputeOrigin::CancellationEscrow => {
+            test_env
+                .stellar_token_client()
+                .mint(&subscriber, &DISPUTE_AMOUNT);
+            test_env.client.deposit_funds(
+                &subscription_id,
+                &DISPUTE_AMOUNT,
+                &None::<soroban_sdk::BytesN<32>>,
+            );
+            test_env
+                .client
+                .cancel_subscription(&subscription_id, &subscriber);
+            test_env
+                .client
+                .lodge_escrow_dispute(&merchant, &subscription_id)
+        }
+    };
 
     (dispute_id, subscription_id)
 }
@@ -98,15 +126,20 @@ fn assert_matrix_case(
     expected: Result<(), Error>,
     advance_window: bool,
 ) {
-    let test_env = TestEnv::default();
-    let (dispute_id, _) = open_dispute(&test_env);
-    prepare_status(&test_env, dispute_id, from);
+    for origin in [
+        DisputeOrigin::SubscriberOpened,
+        DisputeOrigin::CancellationEscrow,
+    ] {
+        let test_env = TestEnv::default();
+        let (dispute_id, _) = open_dispute(&test_env, origin);
+        prepare_status(&test_env, dispute_id, from);
 
-    if advance_window {
-        test_env.jump(DISPUTE_WINDOW_SECS + 1);
+        if advance_window {
+            test_env.jump(DISPUTE_WINDOW_SECS + 1);
+        }
+
+        assert_eq!(apply_action(&test_env, dispute_id, action), expected);
     }
-
-    assert_eq!(apply_action(&test_env, dispute_id, action), expected);
 }
 
 #[test]
@@ -182,34 +215,39 @@ fn test_dispute_status_transition_matrix() {
 
 #[test]
 fn test_dispute_transition_matrix_emits_events_for_valid_paths() {
-    let test_env = TestEnv::default();
-    let (dispute_id, _) = open_dispute(&test_env);
+    for origin in [
+        DisputeOrigin::SubscriberOpened,
+        DisputeOrigin::CancellationEscrow,
+    ] {
+        let test_env = TestEnv::default();
+        let (dispute_id, _) = open_dispute(&test_env, origin);
 
-    test_env.client.respond_dispute(
-        &test_env.admin,
-        &dispute_id,
-        &None::<soroban_sdk::BytesN<32>>,
-    );
-    let responded = test_env.env.events().all().iter().any(|event| {
-        Symbol::from_val(&test_env.env, &event.1.get(0).unwrap())
-            == Symbol::new(&test_env.env, "dispute_responded")
-    });
-    assert!(
-        responded,
-        "valid Open -> Responded transition emitted no event"
-    );
+        test_env.client.respond_dispute(
+            &test_env.admin,
+            &dispute_id,
+            &None::<soroban_sdk::BytesN<32>>,
+        );
+        let responded = test_env.env.events().all().iter().any(|event| {
+            Symbol::from_val(&test_env.env, &event.1.get(0).unwrap())
+                == Symbol::new(&test_env.env, "dispute_responded")
+        });
+        assert!(
+            responded,
+            "valid Open -> Responded transition emitted no event for {origin:?}"
+        );
 
-    test_env
-        .client
-        .resolve_dispute(&test_env.admin, &dispute_id, &true);
-    let resolved = test_env.env.events().all().iter().any(|event| {
-        Symbol::from_val(&test_env.env, &event.1.get(0).unwrap())
-            == Symbol::new(&test_env.env, "dispute_resolved")
-    });
-    assert!(
-        resolved,
-        "valid Responded -> Resolved transition emitted no event"
-    );
+        test_env
+            .client
+            .resolve_dispute(&test_env.admin, &dispute_id, &true);
+        let resolved = test_env.env.events().all().iter().any(|event| {
+            Symbol::from_val(&test_env.env, &event.1.get(0).unwrap())
+                == Symbol::new(&test_env.env, "dispute_resolved")
+        });
+        assert!(
+            resolved,
+            "valid Responded -> Resolved transition emitted no event for {origin:?}"
+        );
+    }
 }
 
 #[test]
@@ -243,6 +281,61 @@ mod dispute_overpay_invariant {
         DISPUTE_WINDOW_SECS,
     };
     use soroban_sdk::testutils::Address as _;
+
+#[test]
+fn opening_dispute_above_merchant_balance_returns_specific_error() {
+    let test_env = TestEnv::default();
+    let (subscription_id, subscriber, _) = fixtures::create_subscription(
+        &test_env.env,
+        &test_env.client,
+        SubscriptionStatus::Active,
+    );
+    let subscription = test_env.client.get_subscription(&subscription_id);
+    let merchant_balance = DISPUTE_AMOUNT - 1;
+
+    test_env.env.as_contract(&test_env.client.address, || {
+        test_env.env.storage().instance().set(
+            &DataKey::MerchantBalance(subscription.merchant.clone(), subscription.token.clone()),
+            &merchant_balance,
+        );
+    });
+
+    assert_eq!(
+        test_env.client.try_open_dispute(
+            &subscriber,
+            &subscription_id,
+            &DISPUTE_AMOUNT,
+            &None::<soroban_sdk::BytesN<32>>,
+        ),
+        Err(Ok(Error::DisputeAmountExceedsMerchantBalance)),
+    );
+
+    let dispute_state = test_env.env.as_contract(&test_env.client.address, || {
+        (
+            test_env
+                .env
+                .storage()
+                .instance()
+                .get::<_, i128>(&DataKey::MerchantBalance(
+                    subscription.merchant.clone(),
+                    subscription.token.clone(),
+                )),
+            test_env
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::SubscriptionDispute(subscription_id)),
+            test_env
+                .env
+                .storage()
+                .instance()
+                .has(&DataKey::DisputeEscrow(0)),
+        )
+    });
+    assert_eq!(dispute_state.0, Some(merchant_balance));
+    assert!(!dispute_state.1);
+    assert!(!dispute_state.2);
+}
 
     const DISPUTE_AMOUNT: i128 = 5_000_000;
 

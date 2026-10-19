@@ -175,7 +175,7 @@ fn test_upgrade_via_migrate() {
     });
 
     env.mock_all_auths();
-    client.migrate(&admin);
+    client.migrate(&admin, &false);
 
     env.as_contract(&contract_id, || {
         let storage = env.storage();
@@ -261,7 +261,7 @@ fn test_rejection_of_schema_downgrades() {
     assert_eq!(err1, Err(Ok(Error::SchemaMigrationDowngrade)));
 
     // migrate to version 3 should also fail (with SchemaVersionMismatch)
-    let err2 = client.try_migrate(&admin);
+    let err2 = client.try_migrate(&admin, &false);
     assert_eq!(err2, Err(Ok(Error::SchemaVersionMismatch)));
 }
 
@@ -291,7 +291,7 @@ fn test_migrate_state_unchanged_on_version_far_above_expected() {
     });
 
     // Attempt to migrate — should fail with SchemaVersionMismatch
-    let err = client.try_migrate(&admin);
+    let err = client.try_migrate(&admin, &false);
     assert_eq!(err, Err(Ok(Error::SchemaVersionMismatch)));
 
     // State must remain untouched
@@ -358,7 +358,7 @@ fn test_v1_state_migrates_to_v3_correctly() {
     });
 
     // Call migrate — should upgrade v1 → v2 → v3
-    client.migrate(&admin);
+    client.migrate(&admin, &false);
 
     // Verify final state: schema version = 3, all config in persistent storage
     env.as_contract(&contract_id, || {
@@ -411,7 +411,7 @@ fn test_v1_state_with_partial_data_migrates_correctly() {
     env.mock_all_auths();
 
     // Migrate should succeed even with partial data
-    client.migrate(&admin);
+    client.migrate(&admin, &false);
 
     // Verify migration completed
     env.as_contract(&contract_id, || {
@@ -493,7 +493,7 @@ fn test_v1_to_v3_migration_preserves_all_operational_data() {
     });
 
     env.mock_all_auths();
-    client.migrate(&admin);
+    client.migrate(&admin, &false);
 
     // Verify all data was preserved
     env.as_contract(&contract_id, || {
@@ -562,7 +562,7 @@ fn test_migrate_from_version_zero_proceeds() {
     });
 
     // Migrate should succeed (upgrade ladder from v0 → v2 → v3)
-    client.migrate(&admin);
+    client.migrate(&admin, &false);
 
     // Verify final state
     env.as_contract(&contract_id, || {

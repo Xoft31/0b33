@@ -25,22 +25,30 @@ cross-contract transfers.
 
 ### Overview
 
-The contract stores a `DataKey::SchemaVersion` key in instance storage. Its value
-must always equal the binary's `STORAGE_VERSION` constant (currently `2`).
+The contract stores a `DataKey::SchemaVersion` key in contract storage. Its value
+must match the binary's `STORAGE_VERSION` constant (currently `5`).
 
 - `init` writes `SchemaVersion = STORAGE_VERSION` on first call.
-- The `migrate(admin)` entrypoint compares the on-chain stored version against the
-  binary version and runs registered upgrade closures for the `(from, to)` pair.
+- `migrate(admin, dry_run)` compares the on-chain stored version against the
+  binary version and either previews or applies the required upgrade steps.
 
-### `migrate(admin)` entrypoint
+### `migrate(admin, dry_run)` entrypoint
 
 Implemented in `contracts/subscription_vault/src/lib.rs` (delegates to `admin::do_migrate`).
 
 | Stored version | Binary version | Result |
 |:---:|:---:|:---|
-| `stored > binary` | — | `Err(SchemaMigrationDowngrade)` — downgrade rejected |
-| `stored == binary` | — | `Ok(())` — idempotent no-op, no event emitted |
-| `stored < binary` | — | Runs upgrade ladder, writes new version, emits `SchemaMigratedEvent` |
+| `stored > binary` | — | `Err(SchemaVersionMismatch)` (9102) — downgrade rejected |
+| `stored == binary` | — | Returns a no-op summary; no event emitted |
+| `stored < binary`, `dry_run = true` | — | Returns a preview summary without changing storage or emitting an event |
+| `stored < binary`, `dry_run = false` | — | Applies the upgrade ladder, writes the new version, emits `SchemaMigratedEvent`, and returns the summary |
+
+The returned `SchemaMigrationSummary` reports `from_version`, `to_version`,
+the number of legacy config keys to move, the subscription rewrite counts for
+the v3-to-v4 and v4-to-v5 steps, whether this was a dry run, and whether the
+schema version would change. A preview still requires admin authorization.
+Run with `dry_run = true` first, review the summary, then call with
+`dry_run = false` to apply the same planned migration.
 
 **Auth:** Admin only. `admin.require_auth()` is called before any state is read.
 
@@ -66,13 +74,15 @@ Each arm must be self-contained and must not assume any prior arm ran in the sam
 
 ### Security properties
 
-- **Downgrade guard:** if the on-chain version is newer than the binary, the call is
-  rejected immediately with `SchemaMigrationDowngrade`, preventing accidental rollback
-  corruption.
+- **Downgrade guard:** if the on-chain version is newer than the binary,
+  `migrate()` returns `SchemaVersionMismatch` (9102); the legacy
+  `migrate_config_to_persistent()` path returns `SchemaMigrationDowngrade` (9101)
+  for stored versions above v3. Both prevent accidental rollback corruption.
 - **Idempotent:** calling `migrate` when already at the current version is a safe no-op.
 - **Admin-only:** non-admin callers are rejected with `Unauthorized`.
-- **No fund movement:** `migrate` only reads and writes the `SchemaVersion` instance key.
-  No token transfers, subscription mutations, or balance changes occur.
+- **No fund movement:** `migrate` may move legacy config keys and rewrite
+  subscription storage records, but performs no token transfers or balance
+  changes. With `dry_run = true`, it does not write storage or emit events.
 - **Audit trail:** every successful upgrade emits a `SchemaMigratedEvent` with the
   admin address, version pair, and ledger timestamp.
 
@@ -95,31 +105,60 @@ the upgraded binary. There is no safe, general-purpose way to reverse that rewri
 - Subscription records rewritten by the upgrade step cannot be decoded by the previous binary
   without access to the old struct definition, which is not retained.
 - Re-deploying the old WASM and calling `migrate()` would immediately trigger
-  `SchemaMigrationDowngrade` (code `9101`) and be rejected before touching any state.
+  `SchemaVersionMismatch` (code `9102`) and be rejected without changing storage.
 
 Attempting a rollback by force (e.g. re-uploading old WASM without calling `migrate()`) would
 leave the stored `SchemaVersion` higher than the binary constant, causing every entrypoint that
 reads migrated storage keys to panic on deserialization.
 
-#### `SchemaMigrationDowngrade` (code `9101`)
+#### Downgrade errors
 
-This error is the contract's primary rollback guard. It is raised at the very start of
-`migrate()` (and `migrate_config_to_persistent()`) before any state is touched:
+Both migration entrypoints reject unsupported stored schemas before writing migration
+changes. `migrate()` returns `SchemaVersionMismatch` (code `9102`) when
+`stored_version > STORAGE_VERSION`. The legacy `migrate_config_to_persistent()` endpoint
+supports schemas through v3 and returns `SchemaMigrationDowngrade` (code `9101`) when the
+stored version is greater than 3:
 
 ```rust
 // contracts/subscription_vault/src/admin.rs — do_migrate
 let stored_version = get_schema_version(env);
 if stored_version > binary_version {
-    return Err(Error::SchemaMigrationDowngrade);
+    return Err(Error::SchemaVersionMismatch);
 }
 ```
 
 | Condition | Error | Meaning |
 |-----------|-------|---------|
-| `stored_version > binary_version` | `SchemaMigrationDowngrade` (9101) | On-chain state is newer than the deployed binary. Deploying an old binary and calling `migrate()` is rejected immediately. No state is read or written. |
-| `stored_version != expected` (config migration path) | `SchemaMigrationDowngrade` (9101) | Same guard applied in `migrate_config_to_persistent`. |
+| `stored_version > STORAGE_VERSION` in `migrate()` | `SchemaVersionMismatch` (9102) | On-chain state is newer than the deployed binary. The call returns before migration writes or event emission. |
+| `stored_version > 3` in `migrate_config_to_persistent()` | `SchemaMigrationDowngrade` (9101) | The legacy config migration only supports schemas through v3 and rejects newer state. |
 
-See [`docs/errors.md`](errors.md) for the full error table entry and retry guidance.
+#### Recovery after a downgrade rejection
+
+The stored schema version is intentionally **not reset** when a downgrade is rejected.
+It records the schema of the data already on-chain; resetting the marker would not undo
+any storage-layout changes and could make the deployed binary misinterpret that data.
+Repeatedly calling the same older binary's migration entrypoint will therefore return
+the same error. A rejected call does not emit `SchemaMigratedEvent`.
+
+To recover:
+
+1. Stop retrying with the older binary. Do not manually lower or delete
+   `DataKey::SchemaVersion`.
+2. Determine the stored schema version from the contract's on-chain storage and confirm
+   which schema layouts the candidate WASM can read. The `version()` endpoint and
+   `export_contract_snapshot.storage_version` report the binary's compile-time version,
+   not the stored version.
+3. Upgrade to a binary that supports the current on-chain schema and whose
+   `STORAGE_VERSION` is at least the stored version. If the versions match, no migration
+   is needed. If the binary is newer, call `migrate(admin, true)` to review the planned
+   forward migration, then call `migrate(admin, false)` to apply it.
+4. If no compatible binary is available, prepare and validate one that can read the
+   current storage layout before upgrading. If restoring old behavior is required, do so
+   with a compatible forward hotfix; do not redeploy an older binary or falsify the
+   schema marker.
+
+If the stored version is unexpectedly high, investigate the deployment and migration
+history before proceeding. See [`docs/errors.md`](errors.md) for the error table.
 
 ### Hotfix strategy when a forward migration must be undone
 
@@ -202,8 +241,9 @@ All export functions require **admin authentication** and are read-only.
    - balances and statuses are as expected
 4. A new contract version is deployed and imported using a controlled, external
    migration process (out of scope for this contract).
-5. Admin calls `migrate(admin)` on the new deployment to advance `SchemaVersion`
-   and confirm the upgrade ladder ran successfully.
+5. Admin previews with `migrate(admin, dry_run = true)`, reviews the returned
+  summary, then calls `migrate(admin, dry_run = false)` to advance
+  `SchemaVersion` and apply the upgrade ladder.
 
 ## Security and limitations
 
@@ -211,7 +251,7 @@ All export functions require **admin authentication** and are read-only.
 - No funds can be moved via these hooks.
 - The contract does **not** include a generic import hook; imports are intentionally
   excluded to prevent misuse and to keep the surface area minimal.
-- Storage versioning is exposed as a constant (`STORAGE_VERSION = 2`) to support
+- Storage versioning is exposed as a constant (`STORAGE_VERSION = 5`) to support
   migration tooling decisions.
 
 ## Caveats
@@ -229,7 +269,7 @@ The following tests in `contracts/subscription_vault/src/test.rs` cover the
 |---|---|
 | `test_init_writes_schema_version` | `init` writes `SchemaVersion = 2` |
 | `test_migrate_same_version_is_noop_success` | Same-version call returns `Ok`, no event |
-| `test_migrate_downgrade_is_rejected` | Stored > binary → `SchemaMigrationDowngrade` |
+| `test_migrate_downgrade_is_rejected` | Stored > binary → `SchemaVersionMismatch` |
 | `test_migrate_non_admin_is_rejected` | Non-admin → `Unauthorized` |
 | `test_migrate_forward_upgrade_writes_version_and_emits_event` | v0 → v2: version written, event emitted |
 | `test_migrate_forward_from_version_1_to_2` | v1 → v2: succeeds |
@@ -271,7 +311,7 @@ The golden regression test suite provides automated validation of snapshot stabi
 - No funds can be moved via these hooks.
 - The contract does **not** include a generic import hook; imports are intentionally
   excluded to prevent misuse and to keep the surface area minimal.
-- Storage versioning is exposed as a constant (`STORAGE_VERSION = 2`) to support
+- Storage versioning is exposed as a constant (`STORAGE_VERSION = 5`) to support
   migration tooling decisions.
 
 ## Caveats

@@ -281,7 +281,7 @@ All 30+ events defined with stable schemas. Extensions are backward compatible:
 1. Announce deprecation (emit both old and new events)
 2. Coordinate with indexer operators
 3. Plan migration window
-4. Version bump: schema v2
+4. Version bump: schema v3
 
 ---
 

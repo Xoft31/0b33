@@ -10,9 +10,131 @@ Despite careful contract design, funds can become stranded in several scenarios:
 
 - **Accidental transfers**: Users send tokens directly to the contract address by mistake
 - **Deprecated flows**: Contract upgrades or bug fixes leave funds in an inaccessible state
-- **Unreachable addresses**: Subscribers lose access to their keys after cancellation
+- **Unreachable addresses**: A subscriber may be unable to authorize their own
+   withdrawal after cancellation; this does not make an accounted balance
+   eligible for admin recovery.
 
 The recovery mechanism provides a last-resort option to prevent permanent fund loss while maintaining strong security guarantees.
+
+## Operational Procedures
+
+There are two distinct recovery paths. Admin recovery transfers only unaccounted
+surplus under governance controls; subscriber withdrawal returns funds still
+owed to that subscriber. Admin recovery cannot substitute for a subscriber
+withdrawal or redirect an accounted balance to a new address.
+
+### Admin-initiated stranded-fund recovery
+
+1. **Establish eligibility.** Identify the token, exact amount, recipient, and
+   applicable `RecoveryReason`. Confirm that the funds are not represented by
+   subscriber prepaid balances, merchant liabilities, or cancellation escrow,
+   and that no normal contract operation can release them. For `ExpiredEscrow`,
+   also document that the escrow amount is no longer included in
+   `total_accounted`; an elapsed escrow window or an unreachable subscriber is
+   not enough by itself.
+2. **Reconcile and prepare approval.** Call the public,
+   unauthenticated `get_token_reconciliation(token)` query. Confirm
+   `is_balanced == true` and preserve the returned values as evidence. The
+   recovery is capped at `recoverable_amount`, which excludes prepaid balances
+   and other accounted liabilities. Where guardians are configured, create a
+   `RecoverStrandedFunds` governance proposal matching the recipient, token,
+   and amount expected to be transferred after that cap; it must pass quorum
+   and its timelock before execution. Without configured guardians, the
+   contract retains its single-admin compatibility path.
+3. **Submit the recovery.** The configured admin calls
+   `recover_stranded_funds(admin, token, recipient, amount, recovery_id,
+   reason)` and authorizes the transaction with the admin key. Use a unique
+   `recovery_id`; the contract rejects reuse. The result reports
+   `recovered_amount` and `surplus_amount` (the requested amount that exceeded
+   the available recoverable balance). When guardians are configured, the
+   proposal must match the capped transfer amount and be approved before the
+   call.
+4. **Verify the transaction and event.** Confirm the transaction succeeded and
+   inspect its `recovery` event. Check the admin, recipient, token, amount,
+   reason, and timestamp against the proposal and incident record. The token
+   transfer and event are part of the same transaction, so a failed transfer
+   must not be treated as a completed recovery.
+5. **Verify balances and close the record.** Confirm the recipient's token
+   balance increased by the recovered amount, then query
+   `get_token_reconciliation(token)` again and retain the result and transaction
+   hash. Record the `recovery_id`, proposal, evidence, event, and post-recovery
+   reconciliation in the recovery log.
+
+### Subscriber-initiated withdrawal
+
+1. **Identify the subscriber's funds.** Read the subscription and determine
+   whether the amount remains in `prepaid_balance` or is held in its
+   cancellation escrow. Withdrawal is allowed when the subscription is
+   `Cancelled`, `Expired`, or `Archived`, or when its expiration condition has
+   been reached. The caller must be the subscriber recorded on the subscription
+   (and on the escrow, when withdrawing escrowed funds).
+2. **Check escrow conditions, if applicable.** For cancellation escrow, wait
+   until its `released_at` timestamp and resolve any open dispute first. An
+   early attempt fails with `EscrowNotReleased`; an open dispute fails with
+   `DisputeAlreadyOpen`. These conditions are enforced on-chain.
+3. **Authorize and withdraw.** The subscriber calls
+   `withdraw_subscriber_funds(subscription_id, subscriber)` and signs with the
+   subscriber key. No admin signature or recovery proposal is used. The call
+   transfers the full eligible prepaid balance or escrow amount to that
+   subscriber and clears the corresponding contract record. If the subscriber
+   has lost the key, an admin cannot use this entrypoint on their behalf.
+4. **Verify the withdrawal.** Confirm the transaction succeeded and inspect the
+   `sub_withdrawn` event for the subscription id, subscriber, token, and amount.
+   For an escrow withdrawal, also confirm the
+   `cancellation_escrow_released` event. Verify the subscriber's token balance
+   increased and, for a prepaid-balance withdrawal, confirm the balance is now
+   zero. Retain the transaction hash and event data.
+
+### Identifying stranded subscriptions (`list_recoverable_subscriptions`)
+
+There is no secondary index of cancelled subscriptions — `apply_cancellation`
+removes the id from `MerchantSubs`, `TokenSubs` and `SubscriberSubs` — so
+finding them requires an id-range scan. The contract exposes that scan as a
+view:
+
+```rust
+list_recoverable_subscriptions(
+    cursor: Option<u32>,
+    limit: u32,
+) -> RecoverableSubscriptionsPage
+
+pub struct RecoverableSubscriptionsPage {
+    pub subscriptions: Vec<RecoverableSubscription>, // id, subscriber, merchant, token, prepaid_balance
+    pub next_cursor: Option<u32>,
+}
+```
+
+A subscription is reported when **`status == Cancelled` and
+`prepaid_balance > 0`**. `cursor` is an inclusive lower bound on the
+subscription id (`None` starts at `0`); `limit` must be in
+`1..=MAX_QUERY_RESULTS` or the call fails with `Error::InvalidExportLimit`.
+Results are ascending by id, and each call inspects at most `MAX_SCAN_DEPTH`
+ids. Continue from `next_cursor` while it is `Some`; when it is `None` the scan
+reached the end of the id space, so an empty page with `None` means nothing is
+stranded.
+
+Note the distinction from `list_subscriptions_by_subscriber`: that one reads a
+per-subscriber index and cannot see a cancelled subscription at all, because
+the id has already been removed from the index.
+
+**What a hit means.** In the normal flow `cancel_subscription` zeroes
+`prepaid_balance` and moves the amount into `DataKey::CancellationEscrow`, so a
+match indicates money that reached a cancelled record outside that path:
+
+- a **delegated-payer deposit** (`deposit_funds_on_behalf`) that lands after
+  cancellation, since that path does not gate on `Cancelled`;
+- a record restored from a snapshot export whose escrow accounting was not
+  reproduced by the restore;
+- state migrated from an older storage schema.
+
+**What a hit does not mean.** This query is a reporting and forensics aid. It
+confers no right to move the funds. `recover_stranded_funds` remains
+structurally incapable of touching an accounted balance, and the legitimate
+route for a cancelled subscription's money is still the
+subscriber-authenticated `withdraw_subscriber_funds`. A cancelled subscription
+has no `uncancel` path either — `Cancelled` may only transition to `Archived`.
+
+---
 
 ## Recovery Scenarios
 
@@ -46,9 +168,15 @@ The contract defines four specific recovery reasons, each representing a well-do
 
 #### 3. ExpiredEscrow
 
-**When to use**: Cancelled subscriptions where the subscriber has lost access to their withdrawal keys or the escrow period has expired.
+**When to use**: A cancellation escrow or subscription balance became
+unaccounted because a bug, migration, or state restore dropped its accounting
+record, and the funds are therefore included in the token's recoverable
+surplus. This is not a path for an escrow that remains properly accounted.
 
-**Example**: A subscriber cancels their subscription but loses their private key before withdrawing their prepaid balance.
+**Example**: A migration defect leaves the escrow tokens in the contract but
+drops the record that included them in `total_accounted`. If the escrow remains
+accounted, only the subscriber can withdraw it through
+`withdraw_subscriber_funds`.
 
 **Verification steps**:
 
@@ -100,7 +228,8 @@ and has no `subscription_id` parameter. The only balance gate is:
 
 ```rust
 recoverable = contract_balance - total_accounted(token)
-if amount > recoverable { return Err(Error::InsufficientBalance); }
+recovered_amount = min(amount, max(recoverable, 0))
+surplus_amount = amount - recovered_amount
 ```
 
 `total_accounted` aggregates every subscriber prepaid balance, every merchant
@@ -120,7 +249,7 @@ changes the outcome of a recovery attempt.
 | 1. `Active` with a prepaid balance | `Subscription.prepaid_balance` | Yes | **No** | Normal billing. |
 | 2. `cancel_subscription` succeeds | Zeroed on the record, moved to `DataKey::CancellationEscrow(subscription_id)` | **Yes** (escrowed, not yet transferred) | **No** | Wait out the dispute window. Nothing to recover. |
 | 3. Escrow window elapsed, subscriber withdraws | Transferred to the subscriber; `sub_total_accounted` decremented | No | n/a — balance left the contract | Done. |
-| 4. Escrow window elapsed, subscriber never withdraws | Still in `CancellationEscrow` | **Yes** | **No** | Subscriber must call `withdraw_subscriber_funds`. Admin cannot. |
+| 4. Escrow window elapsed, subscriber never withdraws | Still in `CancellationEscrow` | **Yes** | **No** | Subscriber calls `withdraw_subscriber_funds` or `claim_cancellation_escrow`. The subscriber-authenticated claim refreshes the escrow TTL. Admin cannot claim it. |
 
 Note stage 3: the escrow release decrements `total_accounted` at *withdrawal*
 time, not at cancellation time. So cancelling a subscription does not change
@@ -153,17 +282,17 @@ evidence, that:
    withdrawal and must be resolved first).
 
 If step 3 cannot be demonstrated, the correct path is to let the subscriber
-withdraw. Attempting recovery of accounted funds returns
-`Error::InsufficientBalance` and — if forced through a state bug — would be a
-governance violation.
+withdraw. A recovery request cannot draw on accounted funds; if no unaccounted
+balance exists, it returns `recovered_amount: 0` and reports the request as
+`surplus_amount`.
 
 ### What an admin sees when they try
 
 | Attempt | Result |
 |---------|--------|
-| Recover the refund of a `Cancelled` subscription whose escrow is still accounted | `Error::InsufficientBalance` (code `1001`) — `amount > recoverable` |
-| Recover the refund of a `Cancelled` subscription after the subscriber already withdrew | `Error::InsufficientBalance` — the funds left the contract entirely |
-| Recover the refund of a `Cancelled` subscription, amount within an unrelated surplus | Succeeds only for the surplus. The escrowed portion is never included in the `amount`. Do not net the two: net recoveries look like theft in the audit trail. |
+| Recover the refund of a `Cancelled` subscription whose escrow is still accounted | Transfers no escrowed funds; reports `recovered_amount: 0` if no unrelated recoverable balance exists |
+| Recover the refund of a `Cancelled` subscription after the subscriber already withdrew | Transfers no funds if the contract has no unaccounted balance |
+| Request more than an unrelated surplus | Succeeds only for the available surplus and reports the excess request as `surplus_amount`. The escrowed portion is never included. Do not net the two: net recoveries look like theft in the audit trail. |
 | Recover a genuinely orphaned, unaccounted escrow after an upgrade/migration bug | Succeeds with `RecoveryReason::ExpiredEscrow` and the evidence above |
 
 ### Support checklist for a cancelled subscription
@@ -226,7 +355,8 @@ if admin != stored_admin {
 
 - Amount must be positive (> 0)
 - Prevents accidental calls with zero or negative values
-- Amount must be less than or equal to the available recoverable balance
+- Recovery is capped at the available recoverable balance
+- Any excess request is reported as `surplus_amount` in `RecoveryResult`
 - Recoverable balance is calculated as `actual_token_balance - total_accounted_balance` to ensure user and merchant active funds are strictly protected.
 
 ```rust
@@ -234,10 +364,9 @@ if amount <= 0 {
     return Err(Error::InvalidRecoveryAmount);
 }
 
-let recoverable = contract_balance.checked_sub(accounted_balance)?;
-if amount > recoverable {
-    return Err(Error::InsufficientBalance);
-}
+let recoverable = contract_balance.checked_sub(accounted_balance)?.max(0);
+let recovered_amount = amount.min(recoverable);
+let surplus_amount = amount - recovered_amount;
 ```
 
 #### 2.1 Replay Protection
@@ -305,9 +434,10 @@ env.events().publish((Symbol::new(&env, "recovery"), admin.clone()), recovery_ev
    - Community members validate the evidence
    - Legal review if necessary
 
-4. **Authorization**: Admin multi-sig approves the recovery
-   - Sufficient signatures from authorized parties
-   - Recorded vote or decision
+4. **Authorization**: Where guardians are configured, the recovery proposal
+   passes quorum and its timelock before the admin executes it. Otherwise, the
+   configured admin authorizes the call under the single-admin compatibility
+   path. Record the approval decision.
 
 ### During Recovery
 
@@ -509,18 +639,27 @@ Usage notes:
 - Each export and restore emits `snapshot_exported` and `snapshot_restored` events respectively.
 
 
-### Example 2: Expired Escrow Recovery
+### Example 2: Orphaned Escrow Recovery
 
-**Scenario**: Subscriber cancels but loses keys before withdrawal.
+**Scenario**: A migration defect leaves an escrow's tokens in the contract but
+drops the record that counted the escrow in `total_accounted`. The original
+subscriber is unreachable, and support has verified the recipient's new
+address. If the escrow remains accounted, do not use this procedure; the
+subscriber must use `withdraw_subscriber_funds`.
 
 **Process**:
 
-1. Subscriber contacts support via alternative channel
-2. Provides identity verification
-3. Admin verifies subscription is cancelled with balance
-4. Confirms reasonable time elapsed (e.g., 90 days)
-5. Creates proposal documenting the situation
-6. After community review, recovers to subscriber's new address
+1. Admin documents the migration defect and verifies the original escrow data.
+2. Query `get_token_reconciliation(token)` and verify that the amount is
+   unaccounted and included in `recoverable_amount`.
+3. Record evidence that the escrow window elapsed, the subscriber is
+   unreachable, no dispute is open, and the new recipient address is verified.
+4. Create a `RecoverStrandedFunds` proposal with `ExpiredEscrow` rationale;
+   obtain quorum and wait for the timelock if guardians are configured.
+5. Admin submits the recovery with a unique `recovery_id` and the approved
+   recipient, token, and amount.
+6. Verify the `recovery` event and recipient balance, then re-run reconciliation
+   and publish the transaction and evidence.
 
 **Code**:
 
@@ -557,11 +696,21 @@ Used responsibly with strong governance, recovery can save genuinely stranded fu
 - Cancellation semantics: `docs/cancellation.md`
 - Reconciling balances: `docs/reconciliation_strategy.md`
 - Admin recovery function: `recover_stranded_funds()`
+- Stranded-subscription query: `list_recoverable_subscriptions()`
 - Recovery event type: `RecoveryEvent`
+- Recovery initiator label: `RecoveryInitiatorRole` enum
 - Recovery reasons: `RecoveryReason` enum
 
 ## Changelog
 
+- 2026-10-16: Added `list_recoverable_subscriptions` (#438) — surfaces
+  subscriptions stranded in `Cancelled` status with a non-zero
+  `prepaid_balance`, paginated by cursor. Reporting/forensics only; it grants
+  no right to move funds.
+- 2026-10-16: Added `initiator_role` to `RecoveryEvent` and
+  `SubscriberWithdrawalEvent` (#437) — event schema v4. Lets auditors tell the
+  admin recovery path from the subscriber withdrawal path when reading a single
+  stream of recovery events. Values are pinned by authorization, not input.
 - 2026-02-21: Initial documentation for admin recovery feature
 - 2026-09-25: Added **Recovery after subscription cancellation** — normative
   statement that a `Cancelled` subscription's funds are not admin-recoverable,

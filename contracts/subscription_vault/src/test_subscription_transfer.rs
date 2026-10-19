@@ -55,6 +55,61 @@ fn test_happy_path_transfer() {
 }
 
 #[test]
+fn test_active_transfer_respects_new_subscriber_cap_and_moves_count() {
+    let (env, client, admin, token, merchant, sub1, sub2) = setup();
+    let incoming_id = client.create_subscription_with_token(
+        &sub1, &merchant, &token, &10_000, &86400, &false, &None, &None,
+    );
+    let existing_id = client.create_subscription_with_token(
+        &sub2, &merchant, &token, &10_000, &86400, &false, &None, &None,
+    );
+    client.set_subscriber_active_cap(&admin, &sub2, &Some(1u32));
+
+    assert_eq!(client.get_subscriber_active_count(&sub1), 1);
+    assert_eq!(client.get_subscriber_active_count(&sub2), 1);
+
+    let expires_at = env.ledger().timestamp() + 3600;
+    client.initiate_transfer(&incoming_id, &sub1, &sub2, &expires_at);
+    let rejected = client.try_accept_transfer(&incoming_id, &sub2);
+    assert_eq!(
+        rejected,
+        Err(Ok(Error::MaxConcurrentSubscriptionsReached))
+    );
+    assert_eq!(client.get_subscription(&incoming_id).subscriber, sub1);
+    assert_eq!(client.get_subscriber_active_count(&sub1), 1);
+    assert_eq!(client.get_subscriber_active_count(&sub2), 1);
+
+    client.set_subscriber_active_cap(&admin, &sub2, &Some(2u32));
+    client.accept_transfer(&incoming_id, &sub2);
+    assert_eq!(client.get_subscriber_active_count(&sub1), 0);
+    assert_eq!(client.get_subscriber_active_count(&sub2), 2);
+    assert_eq!(client.get_subscription(&existing_id).subscriber, sub2);
+}
+
+#[test]
+fn test_transfer_rechecks_new_subscriber_credit_limit() {
+    let (env, client, admin, token, merchant, sub1, sub2) = setup();
+    let incoming_id = client.create_subscription_with_token(
+        &sub1, &merchant, &token, &10_000, &86400, &false, &None, &None,
+    );
+    client.deposit_funds(&incoming_id, &50_000, &None);
+    client.create_subscription_with_token(
+        &sub2, &merchant, &token, &10_000, &86400, &false, &None, &None,
+    );
+    client.set_subscriber_credit_limit(&admin, &sub2, &token, &15_000);
+
+    let expires_at = env.ledger().timestamp() + 3600;
+    client.initiate_transfer(&incoming_id, &sub1, &sub2, &expires_at);
+    let rejected = client.try_accept_transfer(&incoming_id, &sub2);
+    assert_eq!(rejected, Err(Ok(Error::CreditLimitExceeded)));
+    assert_eq!(client.get_subscription(&incoming_id).subscriber, sub1);
+
+    client.set_subscriber_credit_limit(&admin, &sub2, &token, &100_000);
+    client.accept_transfer(&incoming_id, &sub2);
+    assert_eq!(client.get_subscription(&incoming_id).subscriber, sub2);
+}
+
+#[test]
 fn test_merchant_veto_before_acceptance() {
     let (env, client, _admin, token, merchant, sub1, sub2) = setup();
 

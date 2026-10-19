@@ -67,7 +67,7 @@ Key design properties:
 | **Admin** | Singleton address set at `init`. Rotatable via `rotate_admin`. | `init`, `set_min_topup`, `rotate_admin`, `recover_stranded_funds`, `batch_charge`, `charge_subscription`, `charge_usage`, `charge_usage_with_reference`, `charge_one_off`, `enable_emergency_stop`, `disable_emergency_stop`, `export_contract_snapshot`, `export_subscription_summary`, `export_subscription_summaries`, `add_accepted_token`, `remove_accepted_token`, `set_billing_retention`, `partial_refund`, `set_oracle_config`, `set_subscriber_credit_limit`, `add_to_blocklist` (global), `remove_from_blocklist` |
 | **Subscriber** | Owner of a subscription; identified by their Stellar address. Must sign. | `create_subscription`, `create_subscription_with_token`, `create_subscription_from_plan`, `deposit_funds`, `pause_subscription`, `resume_subscription`, `cancel_subscription`, `withdraw_subscriber_funds`, `migrate_subscription_to_plan` |
 | **Merchant** | Recipient of subscription charges. Must sign for merchant actions. | `create_plan_template`, `create_plan_template_with_token`, `update_plan_template`, `set_plan_max_active_subs`, `pause_subscription` (own), `resume_subscription` (own), `cancel_subscription` (own), `withdraw_merchant_funds`, `withdraw_merchant_token_funds`, `merchant_refund`, `pause_merchant`, `unpause_merchant`, `configure_usage_limits`, `add_to_blocklist` (scoped to own subscribers) |
-| **Anyone** | No auth required. | `get_subscription`, `get_subscription_count`, `get_merchant_balance`, `get_merchant_balance_by_token`, `get_plan_template`, `get_plan_max_active_subs`, `get_next_charge_info`, `estimate_topup_for_intervals`, `get_subscriptions_by_merchant`, `get_subscriptions_by_token`, `list_subscriptions_by_subscriber`, `get_cap_info`, `get_sub_statements_offset`, `get_sub_statements_cursor`, `get_admin`, `get_min_topup`, `get_emergency_stop_status`, `list_accepted_tokens`, `is_blocklisted`, `get_blocklist_entry`, `get_subscriber_credit_limit`, `get_subscriber_exposure`, `get_merchant_subscription_count`, `get_merchant_total_earnings`, `get_reconciliation_snapshot` |
+| **Anyone** | No auth required. | `get_subscription`, `get_subscription_count`, `get_merchant_balance`, `get_merchant_balance_by_token`, `get_merchant_balance_aggregated`, `get_merchant_token_earnings_with_sub_accounts`, `get_merchant_total_earnings_with_sub_accounts`, `get_plan_template`, `get_plan_max_active_subs`, `get_next_charge_info`, `estimate_topup_for_intervals`, `get_subscriptions_by_merchant`, `get_subscriptions_by_token`, `list_subscriptions_by_token`, `list_subscriptions_by_subscriber`, `get_cap_info`, `get_sub_statements_offset`, `get_sub_statements_cursor`, `get_admin`, `get_min_topup`, `get_emergency_stop_status`, `list_accepted_tokens`, `is_blocklisted`, `get_blocklist_entry`, `get_subscriber_credit_limit`, `get_subscriber_exposure`, `get_merchant_subscription_count`, `get_merchant_total_earnings`, `get_reconciliation_snapshot` |
 
 > **Note on `pause_subscription` / `resume_subscription` / `cancel_subscription`:**
 > These accept an `authorizer: Address` parameter. The caller must be either the
@@ -87,7 +87,7 @@ Key design properties:
 | `get_min_topup` | `() -> i128` | None | |
 | `get_admin` | `() -> Address` | None | |
 | `rotate_admin` | `(current_admin, new_admin) -> ()` | Admin | Emits `AdminRotatedEvent`. Existing subscriptions are unaffected. |
-| `recover_stranded_funds` | `(admin, recipient, amount, reason) -> ()` | Admin | `reason` is `RecoveryReason`: `AccidentalTransfer`=0, `DeprecatedFlow`=1, `UnreachableSubscriber`=2. |
+| `recover_stranded_funds` | `(admin, token, recipient, amount, recovery_id, reason) -> RecoveryResult` | Admin | Transfer is capped at the available unaccounted balance. `RecoveryResult` reports `recovered_amount` and any excess requested amount as `surplus_amount`. `reason` is `RecoveryReason`: `UserOverpayment`=0, `FailedTransfer`=1, `ExpiredEscrow`=2, `SystemCorrection`=3, `AccidentalTransfer`=4. |
 | `set_oracle_config` | `(admin, enabled, oracle, max_age_seconds) -> ()` | Admin | When enabled, subscription `amount` is interpreted as quote-currency and converted via oracle price. |
 | `get_oracle_config` | `() -> OracleConfig` | None | |
 | `set_billing_retention` | `(admin, keep_recent) -> ()` | Admin | Configures how many detailed statement rows are retained per subscription. |
@@ -142,9 +142,10 @@ withdrawals, pause/resume/cancel, and export calls are **not** blocked.
 | `charge_usage_with_reference` | `(subscription_id, usage_amount, reference) -> ()` | Admin | Same as above with explicit replay-protection reference string. |
 | `charge_one_off` | `(subscription_id, merchant, amount) -> ()` | Merchant | Merchant-initiated ad-hoc debit. Blocked by emergency stop. |
 
-`BatchChargeResult` fields: `{ success: bool, error_code: u32 }`. When
-`success` is `false`, `error_code` identifies why that item failed (see [Error
-Codes](#error-codes-failure-modes--retry-behavior)).
+`BatchChargeResult` fields: `{ subscription_id: u32, success: bool,
+error_code: u32 }`. `subscription_id` identifies the input item for this
+result independently of vector position. When `success` is `false`,
+`error_code` identifies why that item failed (see [Error Codes](#error-codes-failure-modes--retry-behavior)).
 
 ### Merchant
 
@@ -160,6 +161,9 @@ Codes](#error-codes-failure-modes--retry-behavior)).
 | `merchant_refund` | `(merchant, subscriber, token, amount) -> ()` | Merchant | Debits merchant balance and transfers `amount` to subscriber. |
 | `get_reconciliation_snapshot` | `(merchant) -> Vec<TokenReconciliationSnapshot>` | None | Per-token reconciliation view. |
 | `get_merchant_total_earnings` | `(merchant) -> Vec<(Address, TokenEarnings)>` | None | Lifetime accrued earnings per token. |
+| `get_merchant_token_earnings_with_sub_accounts` | `(merchant, token) -> MerchantTokenEarningsWithSubAccounts` | None | **NEW**: Earnings breakdown with primary + sub-account balances for one token. |
+| `get_merchant_total_earnings_with_sub_accounts` | `(merchant) -> Vec<MerchantTokenEarningsWithSubAccounts>` | None | **NEW**: Earnings breakdown across all tokens with sub-account detail. |
+| `get_merchant_balance_aggregated` | `(merchant, token) -> i128` | None | **NEW**: Total balance (primary + all sub-accounts) for one token. |
 
 ### Queries
 
@@ -168,11 +172,13 @@ Codes](#error-codes-failure-modes--retry-behavior)).
 | `get_subscription` | `(subscription_id) -> Subscription` | None | Returns full `Subscription` struct. |
 | `get_subscription_count` | `() -> u32` | None | Total ever created. |
 | `get_merchant_subscription_count` | `(merchant) -> u32` | None | |
-| `get_subscriptions_by_merchant` | `(merchant, start, limit) -> Vec<Subscription>` | None | Offset pagination. |
+| `get_subscriptions_by_merchant` | `(merchant, start, limit, reverse) -> Vec<Subscription>` | None | Offset pagination. `reverse = true` returns newest-first. |
+| `list_subscriptions_by_merchant` | `(merchant, cursor, limit, reverse) -> SubscriptionsMerchantPage` | None | Cursor pagination with the same `reverse` ordering. |
 | `get_subscriptions_by_token` | `(token, start, limit) -> Vec<Subscription>` | None | Offset pagination. |
+| `list_subscriptions_by_token` | `(token, cursor, limit) -> SubscriptionsTokenPage` | None | Cursor pagination in token-index insertion order. |
 | `list_subscriptions_by_subscriber` | `(subscriber, start_from_id, limit) -> SubscriptionsPage` | None | Cursor-style pagination by subscriber. |
 | `estimate_topup_for_intervals` | `(subscription_id, num_intervals) -> i128` | None | Calculates how much the subscriber needs to deposit to cover the next N intervals. |
-| `get_next_charge_info` | `(subscription_id) -> NextChargeInfo` | None | Returns `{ next_charge_at, is_due, status }`. |
+| `get_next_charge_info` | `(subscription_id) -> NextChargeInfo` | None | Returns next-charge details and `grace_deadline` when a grace period has started, including after its expiry when status is reported as `InsufficientBalance`. |
 | `get_cap_info` | `(subscription_id) -> CapInfo` | None | Lifetime cap summary: cap value, amount charged, remaining, reached flag. |
 | `get_sub_statements_offset` | `(subscription_id, offset, limit, newest_first) -> BillingStatementsPage` | None | Offset pagination for billing statements. `newest_first = true` recommended for infinite scroll. |
 | `get_sub_statements_cursor` | `(subscription_id, cursor, limit, newest_first) -> BillingStatementsPage` | None | Cursor pagination; pass `cursor = None` for first page. |
@@ -294,7 +300,7 @@ Pre-conditions:
 
 ```
 Admin: batch_charge([sub_id])
-  → BatchChargeResult { success: false, error_code: 5001 }
+  → BatchChargeResult { subscription_id: sub_id, success: false, error_code: 5001 }
   → contract emits SubscriptionChargeFailedEvent
   → status transitions to GracePeriod or InsufficientBalance
 
@@ -426,7 +432,7 @@ Admin → disable_emergency_stop(admin)
 |-------|-------------|-----------|
 | `sub_new` | `SubscriptionCreatedEvent` | `subscription_id`, `subscriber`, `merchant`, `amount`, `interval_seconds` |
 | `deposit` | `FundsDepositedEvent` | `subscription_id`, `subscriber`, `amount`, `new_balance` |
-| `charged` | `SubscriptionChargedEvent` | `subscription_id`, `merchant`, `amount`, `remaining_balance` |
+| `charged` | `SubscriptionChargedEvent` | `subscription_id`, `merchant`, `amount`, `prepaid_balance` |
 | `charge_failed` | `SubscriptionChargeFailedEvent` | `subscription_id`, `error_code`, `status` |
 | `paused` | `SubscriptionPausedEvent` | `subscription_id`, `authorizer` |
 | `resumed` | `SubscriptionResumedEvent` | `subscription_id`, `authorizer` |
@@ -630,7 +636,7 @@ function run_billing_batch(ids, nonce):
     if failed is empty:
         return
 
-    # ── Classify each failure. A FRESH nonce is required for the retry. ──
+    # ── Classify failures; nonce depends on whether any item succeeded. ──
     retryable   = []
     wait_for_event = []
     drop = []
@@ -645,8 +651,8 @@ function run_billing_batch(ids, nonce):
             default:                  drop.append(id)        # structural; investigate
 
     if retryable is not empty:
-        # NOTE: fresh nonce — the previous batch consumed its own.
-        run_billing_batch(retryable, fresh_nonce())
+        next_nonce = nonce if succeeded is empty else nonce + 1
+        run_billing_batch(retryable, next_nonce)
 
     for id in wait_for_event:
         # Re-queue on the event, not on a timer. Do not tight-loop: a short
@@ -657,8 +663,9 @@ function run_billing_batch(ids, nonce):
 
 ##### Rules of thumb
 
-1. **Fresh nonce per executed batch.** A nonce is consumed the moment a batch
-   runs, whether or not any item succeeded. Reusing it yields `Replay` (4005).
+1. **Nonce follows successful batch outcomes.** A batch consumes its nonce if
+  at least one item returns `success = true`; an all-failure batch leaves it
+  available for retry. After partial or full success, fetch the next nonce.
 2. **Idempotency comes from the contract, not from your queue.** The
    `period_index` / `last_payment_timestamp` guard means a duplicate attempt
    can never double-charge. Design your retry so it is *cheap and quiet*, not so
@@ -670,7 +677,10 @@ function run_billing_batch(ids, nonce):
 4. **Persist `success = true` ids before building the next batch.** A crash
    between the chain call and your bookkeeping is the one case where a
    genuinely-safe retry becomes a real double-charge risk in *your* ledgers.
-5. **Cap the batch at 50, not 100.** See
+5. **Cap routine batches at 50, not 100.** Accepted calls above 50 IDs emit a
+   `batch_size_warning` event containing the batch size and recommended maximum;
+   use it to observe callers that exceed the recommendation. It is a soft
+   warning, not a rejection. See
    [`batch_charge.md` → Sizing guidance](batch_charge.md#sizing-guidance).
 
 For the contract-side mechanics — `period_index`, nonce domains, and why

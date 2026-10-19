@@ -66,15 +66,18 @@ use crate::safe_math::{safe_add, safe_add_balance, safe_sub, safe_sub_balance};
 use crate::state_machine::transition_to;
 use crate::statements::append_statement;
 use crate::types::{
-    BillingChargeKind, CancellationEscrow, CancellationEscrowReleasedEvent, DataKey, EmergencyWithdrawIntent, Error, FundsDepositedEvent,
-    GlobalCapDefaultUpdatedEvent, LifetimeCapReachedEvent, LifetimeCapUpdatedEvent,
-    MerchantCapDefaultUpdatedEvent, PartialRefundEvent, PlanMaxActiveUpdatedEvent, PlanTemplate,
-    PlanTemplateUpdatedEvent, SubscriberEmergencyWithdrawEvent, SubscriberWithdrawalEvent,
-    Subscription, SubscriptionCancelScheduledEvent, SubscriptionCancelUnscheduledEvent,
-    SubscriptionCancelledEvent, SubscriptionCreatedEvent, SubscriptionMigratedEvent,
-    SubscriptionRecoveryReadyEvent, SubscriptionStatus, UsageLimits, UsageLimitsConfiguredEvent,
-    TOPIC_CAP_REACH, TOPIC_CHARGED, TOPIC_CREATED, TOPIC_DEPOSITED, TOPIC_ONE_OFF_CHARGED,
-    BATCH_MAX_SIZE, SUB_TTL_EXTEND_TO, SUB_TTL_THRESHOLD,
+    BillingChargeKind, CancellationEscrow, CancellationEscrowOpenedEvent,
+    CancellationEscrowReleasedEvent, DataKey, EmergencyWithdrawIntent, Error,
+    FundsDepositedEvent, GlobalCapDefaultUpdatedEvent, GraceBuyoutEvent, LifetimeCapReachedEvent,
+    LifetimeCapUpdatedEvent, MerchantCapDefaultUpdatedEvent, PartialRefundEvent,
+    PlanMaxActiveUpdatedEvent, PlanTemplate, PlanTemplateUpdatedEvent, RateLimitTrippedEvent,
+    ReferralAttributedEvent, SubscriberCreateWindow, SubscriberEmergencyWithdrawEvent,
+    SubscriberWithdrawalEvent, Subscription, SubscriptionCancelScheduledEvent,
+    SubscriptionCancelUnscheduledEvent, SubscriptionCancelledEvent, SubscriptionCreatedEvent,
+    SubscriptionMigratedEvent, SubscriptionRecoveryReadyEvent, SubscriptionStatus, UsageLimits,
+    UsageLimitsConfiguredEvent, TOPIC_CAP_REACH, TOPIC_CHARGED, TOPIC_CREATED, TOPIC_DEPOSITED,
+    TOPIC_ONE_OFF_CHARGED, BATCH_MAX_SIZE, SUB_TTL_EXTEND_TO, SUB_TTL_THRESHOLD,
+    CANCELLATION_ESCROW_WINDOW_SECS,
 };
 use soroban_sdk::{Address, Env, Symbol, Vec};
 
@@ -826,6 +829,7 @@ pub fn do_deposit_funds(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: now,
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -1040,6 +1044,7 @@ pub fn do_grace_buyout(
                 let salt_input = soroban_sdk::Bytes::from_slice(env, &salt_buf);
                 env.crypto().sha256(&salt_input).into()
             },
+            batch_nonce: crate::admin::current_batch_nonce(env),
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
         },
     );
@@ -1066,7 +1071,7 @@ pub fn do_grace_buyout(
             subscription_id,
             &k,
         );
-        crate::idempotency::push_key(env, subscription_id, &hashed, now);
+        crate::idempotency::push_key(env, subscription_id, &hashed, now)?;
     }
 
     Ok((charge_amount, premium))
@@ -1091,6 +1096,7 @@ pub fn do_cancel_subscription(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: env.ledger().timestamp(),
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -1100,6 +1106,12 @@ pub fn do_cancel_subscription(
 
     if authorizer != sub.subscriber && authorizer != sub.merchant {
         return Err(Error::Forbidden);
+    }
+
+    // Blocklisted subscribers may not use cancellation as an escape hatch;
+    // merchants retain the ability to cancel their own subscriptions.
+    if authorizer == sub.subscriber {
+        crate::blocklist::require_not_blocklisted(env, &sub.subscriber)?;
     }
 
     // Reject double-cancellation of an already Cancelled subscription.
@@ -1181,6 +1193,7 @@ fn apply_cancellation(
         env.storage()
             .persistent()
             .set(&DataKey::CancellationEscrow(subscription_id), &escrow);
+        extend_subscription_ttl(env, &DataKey::CancellationEscrow(subscription_id));
 
         env.events().publish(
             (Symbol::new(env, "cancellation_escrow_opened"), subscription_id),
@@ -1236,6 +1249,7 @@ fn apply_cancellation(
             authorizer,
             refund_amount,
             timestamp: env.ledger().timestamp(),
+            batch_nonce: crate::admin::current_batch_nonce(env),
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
         },
     );
@@ -1311,6 +1325,7 @@ pub fn do_schedule_cancel(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: now,
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -1567,6 +1582,7 @@ pub fn do_pause_subscription(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: env.ledger().timestamp(),
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -1650,6 +1666,7 @@ pub fn do_resume_subscription(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: env.ledger().timestamp(),
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -1703,6 +1720,42 @@ pub fn do_resume_subscription(
         },
     );
 
+    Ok(())
+}
+
+/// Resume a subscription paused while its subscriber was blocklisted.
+///
+/// Blocklist removal is an administrative recovery operation, so it cannot
+/// call [`do_resume_subscription`] (which intentionally requires the
+/// subscriber or merchant).  Keep the transition in this module so the
+/// active-subscription index and lifecycle event remain consistent.
+pub(crate) fn resume_after_blocklist_removal(
+    env: &Env,
+    subscription_id: u32,
+    authorizer: Address,
+) -> Result<(), Error> {
+    let mut sub = get_subscription(env, subscription_id)?;
+    if sub.status != SubscriptionStatus::Paused {
+        return Ok(());
+    }
+
+    let previous_status = sub.status;
+    transition_to(&mut sub.status, SubscriptionStatus::Active)?;
+    write_subscription(env, subscription_id, &sub);
+    increment_subscriber_active_count(env, &sub.subscriber);
+
+    env.events().publish(
+        (Symbol::new(env, "sub_resumed"), subscription_id),
+        crate::types::SubscriptionResumedEvent {
+            subscription_id,
+            subscriber: sub.subscriber,
+            merchant: sub.merchant,
+            authorizer,
+            previous_status,
+            timestamp: env.ledger().timestamp(),
+            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+        },
+    );
     Ok(())
 }
 
@@ -1775,6 +1828,7 @@ fn bulk_pause_one(
             crate::types::SubscriptionExpiredEvent {
                 subscription_id,
                 timestamp: env.ledger().timestamp(),
+                batch_nonce: crate::admin::current_batch_nonce(env),
                 schema_version: crate::types::EVENT_SCHEMA_VERSION,
             },
         );
@@ -1817,6 +1871,7 @@ fn bulk_cancel_one(
             crate::types::SubscriptionExpiredEvent {
                 subscription_id,
                 timestamp: env.ledger().timestamp(),
+                batch_nonce: crate::admin::current_batch_nonce(env),
                 schema_version: crate::types::EVENT_SCHEMA_VERSION,
             },
         );
@@ -2055,7 +2110,7 @@ fn bulk_deposit_one(
 
     let now = env.ledger().timestamp();
     // Expiration guard
-    if sub.is_expired(now) {
+    if sub.is_expired(now, env.ledger().sequence()) {
         return crate::types::BulkDepositResult {
             subscription_id,
             success: false,
@@ -2263,6 +2318,7 @@ pub fn do_charge_one_off(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: now,
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -2298,6 +2354,7 @@ pub fn do_charge_one_off(
                         lifetime_cap: cap,
                         lifetime_charged: sub.lifetime_charged,
                         timestamp: now,
+                        batch_nonce: crate::admin::current_batch_nonce(env),
                         schema_version: crate::types::EVENT_SCHEMA_VERSION,
                     },
                 );
@@ -2328,6 +2385,7 @@ pub fn do_charge_one_off(
                     lifetime_cap: cap,
                     lifetime_charged: sub.lifetime_charged,
                     timestamp: now,
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -2402,6 +2460,7 @@ pub fn do_charge_one_off(
                     lifetime_cap: cap,
                     lifetime_charged: sub.lifetime_charged,
                     timestamp: env.ledger().timestamp(),
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -2440,7 +2499,7 @@ pub fn do_charge_one_off(
             subscription_id,
             &k,
         );
-        crate::idempotency::push_key(env, subscription_id, &hashed, now);
+        crate::idempotency::push_key(env, subscription_id, &hashed, now)?;
     }
 
     Ok(())
@@ -2555,6 +2614,9 @@ pub fn do_finalize_emergency_withdraw(
             amount: amount_to_refund,
             timestamp: now,
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            // `subscriber.require_auth()` + the `subscriber == sub.subscriber`
+            // check above already pinned this call to the subscriber path.
+            initiator_role: crate::types::RecoveryInitiatorRole::Subscriber,
         },
     );
 
@@ -2642,6 +2704,8 @@ pub fn do_withdraw_subscriber_funds(
             if subscriber != escrow.subscriber {
                 return Err(Error::Forbidden);
             }
+
+            extend_subscription_ttl(env, &DataKey::CancellationEscrow(subscription_id));
             
             let now = env.ledger().timestamp();
             if now < escrow.released_at {
@@ -2723,6 +2787,9 @@ pub fn do_withdraw_subscriber_funds(
             amount: amount_to_refund,
             timestamp: env.ledger().timestamp(),
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            // `subscriber.require_auth()` + the `subscriber == sub.subscriber`
+            // check above already pinned this call to the subscriber path.
+            initiator_role: crate::types::RecoveryInitiatorRole::Subscriber,
         },
     );
 
@@ -2891,7 +2958,7 @@ pub fn do_deposit_funds_on_behalf(
     }
 
     // Expiration guard
-    if sub.is_expired(now) {
+    if sub.is_expired(now, env.ledger().sequence()) {
         if sub.status != SubscriptionStatus::Expired {
             transition_to(&mut sub.status, SubscriptionStatus::Expired)?;
             write_subscription(env, subscription_id, &sub);
@@ -2900,6 +2967,7 @@ pub fn do_deposit_funds_on_behalf(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: now,
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -3067,13 +3135,13 @@ fn resolve_cap(env: &Env, merchant: &Address, explicit_cap: Option<i128>) -> Opt
     get_global_cap_default(env)
 }
 
-fn lifetime_cap_reached(cap: i128, lifetime_charged: i128) -> bool {
+pub(crate) fn lifetime_cap_reached(cap: i128, lifetime_charged: i128) -> bool {
     let cap_i128: i128 = cap as i128;
     let charged_i128: i128 = lifetime_charged as i128;
     charged_i128 >= cap_i128
 }
 
-fn lifetime_cap_remaining(cap: i128, lifetime_charged: i128) -> i128 {
+pub(crate) fn lifetime_cap_remaining(cap: i128, lifetime_charged: i128) -> i128 {
     let cap_i128: i128 = cap as i128;
     let charged_i128: i128 = lifetime_charged as i128;
     cap_i128.saturating_sub(charged_i128).max(0)
@@ -3230,6 +3298,7 @@ pub fn do_create_plan_template(
         amount,
         interval_seconds,
         trial_seconds: 0,
+        trial_period_seconds: None,
         usage_enabled,
         lifetime_cap,
         template_key: plan_id,
@@ -3285,6 +3354,7 @@ pub fn do_create_plan_template_with_token(
         amount,
         interval_seconds,
         trial_seconds: 0,
+        trial_period_seconds: None,
         usage_enabled,
         lifetime_cap,
         template_key: plan_id,
@@ -3441,6 +3511,7 @@ pub fn do_create_subscription_from_plan(
             interval_seconds: plan.interval_seconds,
             lifetime_cap: plan.lifetime_cap,
             expires_at: None,
+            expires_at_ledger: None,
             timestamp: env.ledger().timestamp(),
             schema_version: crate::types::EVENT_SCHEMA_VERSION,
         },
@@ -3820,7 +3891,7 @@ pub fn do_initiate_transfer(
 ) -> Result<(), Error> {
     from.require_auth();
 
-    let sub = get_subscription(env, subscription_id)?;
+    let mut sub = get_subscription(env, subscription_id)?;
     if sub.subscriber != from {
         return Err(Error::Unauthorized);
     }
@@ -3837,6 +3908,7 @@ pub fn do_initiate_transfer(
                 crate::types::SubscriptionExpiredEvent {
                     subscription_id,
                     timestamp: env.ledger().timestamp(),
+                    batch_nonce: crate::admin::current_batch_nonce(env),
                     schema_version: crate::types::EVENT_SCHEMA_VERSION,
                 },
             );
@@ -3909,6 +3981,30 @@ pub fn do_accept_transfer(
     let additional_liability = safe_add(sub.prepaid_balance, liability_amount)?;
     enforce_credit_limit_for_delta(env, &to, &sub.token, additional_liability)?;
 
+    let counts_toward_active_cap = matches!(
+        sub.status,
+        SubscriptionStatus::Active
+            | SubscriptionStatus::GracePeriod
+            | SubscriptionStatus::InsufficientBalance
+    );
+    if counts_toward_active_cap {
+        let active_count = get_subscriber_active_count(env, &to);
+        let active_cap = get_subscriber_active_cap(env, &to);
+        if active_count >= active_cap {
+            env.events().publish(
+                (Symbol::new(env, "subscriber_cap_reached"), to.clone()),
+                crate::types::SubscriberCapReachedEvent {
+                    subscriber: to.clone(),
+                    active_count,
+                    cap: active_cap,
+                    timestamp: env.ledger().timestamp(),
+                    schema_version: crate::types::EVENT_SCHEMA_VERSION,
+                },
+            );
+            return Err(Error::MaxConcurrentSubscriptionsReached);
+        }
+    }
+
     // Remove from old subscriber's index
     let old_subscriber_key = DataKey::SubscriberSubs(sub.subscriber.clone());
     if let Some(mut ids) = env.storage().instance().get::<_, Vec<u32>>(&old_subscriber_key) {
@@ -3929,6 +4025,10 @@ pub fn do_accept_transfer(
     new_ids.push_back(subscription_id);
     env.storage().instance().set(&new_subscriber_key, &new_ids);
 
+    if counts_toward_active_cap {
+        decrement_subscriber_active_count(env, &sub.subscriber);
+        increment_subscriber_active_count(env, &to);
+    }
     sub.subscriber = to.clone();
     write_subscription(env, subscription_id, &sub);
 

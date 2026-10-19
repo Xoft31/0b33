@@ -13,8 +13,9 @@ By default every subscription is created with `auto_renew = true`, meaning the
 billing engine will continue charging it at each interval boundary indefinitely.
 
 A subscriber or merchant may call `set_auto_renew(false)` to opt out. Once
-disabled, billing halts at the **next interval boundary** — the current period
-completes normally but no further automatic charges are taken. Prepaid balance
+disabled, interval and usage billing halt at the **next interval boundary** —
+the current period completes normally but no further charges are taken. Usage
+charge attempts at or after that boundary return `NotActive`. Prepaid balance
 and all history are preserved in place.
 
 A **renewal window** of one full `interval_seconds` after the flag was first
@@ -140,6 +141,8 @@ if !sub.auto_renew && now >= next_allowed_charge_time {
   continue past non-renewing subscriptions without aborting the batch.
 - `IntervalNotElapsed` still fires normally if the interval has not yet elapsed,
   regardless of `auto_renew`.
+- Usage charges are rejected with `Error::NotActive` once that same interval
+  boundary is reached while `auto_renew = false`.
 
 ---
 

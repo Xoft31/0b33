@@ -20,21 +20,42 @@ env.events().publish(
 - Topic tuple format: `(Symbol, optional_id)` — enables filtering by event type and resource
 - Data struct: always a named type (never raw tuples) — provides stable schema for indexers
 - Data struct field order is append-only: canonical positional fields stay in place and new fields are appended
-- Every event data struct includes a trailing `schema_version: u32` field after the canonical fields
+- Every event data struct includes the originating `contract_id: Address`; event payloads append this field after all existing fields
+- Versioned event data structs include `schema_version: u32`; schema-v4 charge events append `batch_nonce`, `SubscriptionChargedEvent` appends `prepaid_balance` in schema version 5, schema-v5 recovery events append `initiator_role`, schema-v6 dispute resolution events append `resolved_to`, and schema-v7 dispute events append `token`
 - Timestamp: included when useful for ordering/metrics
 - No sensitive data: all event fields are customer-visible
 - One per action: ensures deterministic batch operation ordering
 
-## Schema Versioning Policy This wave-5 update (dispute/escrow and governance/timelock events) documents events already emitted under the existing `schema_version: 2` layout — no field changes were made, so `EVENT_SCHEMA_VERSION` is not bumped by this change.
+## Schema Versioning Policy
 
-`EVENT_SCHEMA_VERSION` is currently `2`. Version `1` is the historical event payload layout
-without an explicit schema version field. Version `2` appends `schema_version: u32` to every event
-data struct.
+Event versions are tracked independently for each event type. Version `1` is the historical
+event payload layout without an explicit schema version field. Version `2` adds
+`schema_version: u32` to every event data struct. Version `3` appends
+`contract_id: Address`, identifying the contract deployment that emitted the event.
+Only an event whose own payload changes advances:
+
+| Event types | Current version | Schema change |
+| --- | ---: | --- |
+| All other event types | 3 | Append `contract_id: Address` |
+| `SubscriptionChargedEvent` | 5 | Append `batch_nonce: Option<u64>` in version 3, `contract_id: Address` in version 3, then `prepaid_balance: i128` |
+| `SplitChargeEvent`, `NonceConsumedEvent`, `DiscountAppliedEvent`, `ChargeFailureEvent`, `SubscriptionChargeFailedEvent`, `SubscriptionCancelledEvent`, `GracePeriodEnteredEvent`, `SubscriptionExpiredEvent`, `LifetimeCapReachedEvent`, `ProtocolFeeChargedEvent`, `FeeConvertedEvent`, `SubscriptionAutoPausedEvent` | 4 | Append `batch_nonce: Option<u64>` in version 3, then `contract_id: Address` |
+| `RecoveryEvent`, `SubscriberWithdrawalEvent` | 5 | Append `initiator_role: RecoveryInitiatorRole` in version 4, then `contract_id: Address` |
+| `DisputeOpenedEvent`, `DisputeRespondedEvent` | 7 | Append `token: Address` in version 6, then `contract_id: Address` |
+| `DisputeResolvedEvent` | 7 | Append `resolved_to: ResolutionTarget` in version 5, `token: Address` in version 6, then `contract_id: Address` |
+
+`EVENT_SCHEMA_VERSION` remains as a deprecated compatibility constant for the maximum version
+currently used. Consumers must inspect the individual event's `schema_version`, not compare it to
+that global maximum. New versioned event types start at version `3`, and subsequent schema changes increment
+only that event type's version. Fields remain append-only to preserve existing positional prefixes
+for indexers.
 
 Indexers should treat the fields listed for each event below as the canonical positional prefix.
-The trailing `schema_version` field is present on every event and is intentionally not repeated in
-each individual field list. Future schema changes must be additive-only: append new fields after
-all existing canonical fields and after the current trailing schema metadata. Removing a field,
+The `contract_id` field is present on every event data struct. Versioned events also include
+`schema_version`. These fields are intentionally not repeated in each individual field list.
+`contract_id` is the emitting contract's address; indexers consuming events from multiple
+deployments should use it to distinguish their origins.
+Future schema changes must be additive-only: append new fields after
+all existing fields, including schema metadata. Removing a field,
 renaming a field, reordering a field, or changing a field type is a breaking schema change that
 requires a new migration plan rather than a silent event update.
 
@@ -87,6 +108,12 @@ Emitted when a subscriber deposits funds into a subscription vault via `deposit_
 
 ## Charging Events
 
+Charge-related events emitted during `batch_charge()` carry
+`batch_nonce: Some(nonce)`, matching the nonce consumed by that batch. This
+includes `NonceConsumedEvent`, successful and failed charge events, discount,
+fee, split, expiration, cancellation, grace-period, auto-pause, and lifetime-cap
+events. The same event types emitted outside a batch carry `batch_nonce: None`.
+
 ### SubscriptionChargedEvent
 
 **Topic:** `("charged",)` _(no subscription ID in topic)_
@@ -99,6 +126,8 @@ Emitted when an interval-based charge succeeds via `charge_subscription()` or `b
 - `merchant`: Address — merchant receiving the payment
 - `amount`: i128 — total charged amount
 - `lifetime_charged`: i128 — cumulative total charged over subscription lifetime
+- `prepaid_balance`: i128 — remaining prepaid balance after this charge; appended after `contract_id` in schema version 5
+- `batch_nonce`: Option<u64> — present when emitted by a batch charge
 
 **Example Use Cases:**
 
@@ -123,6 +152,7 @@ Emitted when a charge attempt fails due to insufficient balance. Subscription tr
 - `shortfall`: i128 — required_amount - available_balance
 - `resulting_status`: SubscriptionStatus — status after failure (GracePeriod or InsufficientBalance)
 - `timestamp`: u64
+- `batch_nonce`: Option<u64> — present when emitted by a batch charge
 
 **Example Use Cases:**
 
@@ -159,6 +189,7 @@ Emitted when protocol fees are extracted and routed to treasury during `charge_s
 - `fee_amount`: i128 — amount routed to treasury
 - `merchant_amount`: i128 — amount retained by merchant after fee
 - `timestamp`: u64
+- `batch_nonce`: Option<u64> — present when emitted by a batch charge
 
 ---
 
@@ -174,6 +205,7 @@ Emitted when a subscription's lifetime charge cap is exhausted. Subscription is 
 - `lifetime_cap`: i128 — configured maximum total charges
 - `lifetime_charged`: i128 — total charged at time of cap hit
 - `timestamp`: u64
+- `batch_nonce`: Option<u64> — present when emitted by a batch charge
 
 **Example Use Cases:**
 
@@ -197,6 +229,26 @@ Emitted when usage-based charges are processed via `charge_usage()`.
 - `token`: Address — settlement token
 - `timestamp`: u64
 - `reference`: String — idempotency reference key
+
+---
+
+### UsageCapResetEvent
+
+**Topic:** `("usage_cap_reset", subscription_id)`
+
+Emitted when a usage-enabled subscription with a configured per-period usage cap enters a later billing period and its accumulated usage is reset.
+
+**Fields:**
+
+- `subscription_id`: u32
+- `merchant`: Address
+- `token`: Address — settlement token
+- `previous_period_index`: u64
+- `current_period_index`: u64
+- `previous_period_usage_units`: i128 — usage accumulated before the reset
+- `usage_cap_units`: i128 — configured per-period cap
+- `timestamp`: u64
+- `schema_version`: u32
 
 ---
 
@@ -353,34 +405,32 @@ Emitted when a subscriber withdraws funds from a cancelled subscription.
 - `subscription_id`: u32
 - `subscriber`: Address
 - `amount`: i128
+- `initiator_role`: RecoveryInitiatorRole — always `Subscriber` (schema-v4)
+
+**Indexer note:** `initiator_role` is the discriminator that separates the two
+recovery paths when they are consumed as one stream. See
+[`RecoveryEvent`](#recoveryevent) below — `recovery` always reports `Admin`,
+`sub_withdrawn` always reports `Subscriber`. The values are pinned by
+authorization, not by caller input, so an indexer can rely on them.
 
 ---
 
 ## Admin & Config Events
 
-### EmergencyStopEnabledEvent
+### EmergencyStopEvent
 
-**Topic:** `("emergency_stop_enabled",)`
+**Topic:** `("emergency_stop_enabled",)` or `("emergency_stop_disabled",)`
 
-Emitted when admin triggers emergency stop via `enable_emergency_stop()`.
-
-**Fields:**
-
-- `admin`: Address
-- `timestamp`: u64
-
----
-
-### EmergencyStopDisabledEvent
-
-**Topic:** `("emergency_stop_disabled",)`
-
-Emitted when admin disables emergency stop via `disable_emergency_stop()`.
+Emitted when the admin toggles emergency stop via `enable_emergency_stop()` or `disable_emergency_stop()`.
 
 **Fields:**
 
 - `admin`: Address
+- `state`: bool — `true` when emergency stop is enabled, `false` when it is disabled
 - `timestamp`: u64
+- `schema_version`: u32
+
+This shared schema allows a single decoder to handle both emergency-stop events.
 
 ---
 
@@ -412,6 +462,21 @@ Emitted when admin recovers stranded funds via `recover_stranded_funds()`.
 - `amount`: i128
 - `reason`: RecoveryReason enum
 - `timestamp`: u64
+- `initiator_role`: RecoveryInitiatorRole — always `Admin` (schema-v4)
+
+**Recovery-path discrimination (schema-v4, #437):** the vault has two
+structurally separate recovery paths, and `initiator_role` labels which one
+released the funds:
+
+| `initiator_role` | Emitted by | Event | Gate |
+|---|---|---|---|
+| `Admin` | `recover_stranded_funds` | `("recovery", admin)` | `require_admin_auth` + multi-sig/governance approval |
+| `Subscriber` | `withdraw_subscriber_funds`, `finalize_emergency_withdraw` | `("sub_withdrawn", subscription_id)` | `subscriber.require_auth()` + subscriber must own the record |
+
+An auditor consuming a unified "funds were released" stream can branch on this
+one field instead of cross-referencing `DataKey::Admin` on-chain. Because the
+paths are gated by different signers, the value cannot be spoofed: it is
+emitted by the contract and never accepted as a parameter.
 
 ---
 
@@ -588,6 +653,8 @@ Emitted when a subscriber opens a dispute via `open_dispute()`. Debits the dispu
 - `amount`: i128 — amount moved into escrow
 - `evidence_hash`: Option<BytesN<32>> — optional subscriber-supplied evidence hash
 - `timestamp`: u64
+- `schema_version`: u32
+- `token`: Address — token denomination of the escrowed amount
 
 **Example Use Cases:**
 
@@ -609,6 +676,8 @@ Emitted when an admin responds to a dispute via `respond_dispute()`, transitioni
 - `subscription_id`: u32
 - `admin_evidence_hash`: Option<BytesN<32>> — optional admin-supplied evidence hash
 - `timestamp`: u64
+- `schema_version`: u32
+- `token`: Address — token denomination of the disputed amount
 
 ---
 
@@ -616,16 +685,33 @@ Emitted when an admin responds to a dispute via `respond_dispute()`, transitioni
 
 **Topic:** `("dispute_resolved", dispute_id)`
 
-Emitted when an admin resolves a dispute via `resolve_dispute()`. Clears the escrow and routes the funds to either the merchant (`ResolvedToMerchant`) or the subscriber (any other resolution status), per `resolution`.
+Emitted when an admin resolves a dispute via `resolve_dispute()`. Clears the escrow and routes the funds to the party identified by `resolved_to`.
 
 **Fields:**
 
 - `dispute_id`: u64
 - `subscription_id`: u32
-- `resolution`: DisputeStatus — the final status (indicates which party received the escrowed funds)
+- `resolution`: DisputeStatus — the final dispute status
 - `timestamp`: u64
+- `schema_version`: u32
+- `resolved_to`: ResolutionTarget — `Subscriber` or `Merchant`, identifying who received the escrowed funds
+- `token`: Address — token denomination of the disputed amount
 
 **Security note:** `open_dispute` requires the caller to be the subscription's subscriber; `respond_dispute`/`resolve_dispute` are admin-only. Double-open is prevented via `DataKey::SubscriptionDispute(subscription_id)` — indexers should not expect more than one open dispute per subscription at a time.
+
+### DisputeWindowUpdatedEvent
+
+**Topic:** `("dispute_window_updated",)`
+
+Emitted when an admin or approved governance proposal changes the global dispute
+response window.
+
+**Fields:**
+
+- `old_window_secs`: u64
+- `new_window_secs`: u64
+- `timestamp`: u64
+- `schema_version`: u32
 
 ---
 
@@ -728,7 +814,7 @@ Emitted when subscriptions are exported via `export_subscription_summaries()`.
 
 **Topic:** `("schema_migrated",)`
 
-Emitted when the contract schema is upgraded via `migrate_schema()`.
+Emitted when the contract schema is upgraded via `migrate(admin, dry_run = false)`.
 
 **Fields:**
 

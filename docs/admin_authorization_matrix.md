@@ -1,5 +1,10 @@
 # Admin Authorization Matrix
 
+> **CI-enforced.** This matrix is validated against `admin.rs` by
+> `scripts/check_admin_matrix.sh`, which parses every `#[contractimpl]`
+> function and fails the build if any entrypoint is missing from the tables
+> below. Run it locally with `./scripts/check_admin_matrix.sh` before pushing.
+
 This document defines the expected authorization behavior for every admin-only
 and operator entrypoint in `subscription_vault`.
 
@@ -18,6 +23,12 @@ and operator entrypoint in `subscription_vault`.
   by a different role model entirely, such as subscriber-or-merchant ownership.
 - Host auth failure (`Error(Auth, InvalidAction)` in tests): no valid signature
   was supplied for a required `require_auth()` check.
+
+The CI check parses `admin.rs` for `#[contractimpl]` functions and asserts that
+every discovered entrypoint appears in one of the tables below. Adding a new
+admin entrypoint without updating this document will fail CI; see the
+**Reviewer Checklist for New Admin Entrypoints** section for the required
+documentation updates.
 
 Admin-only routes return `Unauthorized` for a stale or non-admin signer, or fail at
 the host layer when no signature is present.
@@ -89,6 +100,14 @@ actually transitioned.
 | --- | --- |
 | `get_operator` | `Option<Address>` — current stored operator, or `None` |
 | `get_operator_nonce(op)` | `u64` — next expected nonce for `operator_batch_charge` |
+
+## Automated matrix validation
+
+The matrix above is checked in CI by `scripts/check_admin_matrix.sh`. The script
+extracts every function defined inside a `#[contractimpl]` block in `admin.rs`
+and verifies that each one is listed in exactly one of the entrypoint tables
+(admin, operator, dual-role, or read-only). Any function present in `admin.rs`
+but absent from this document causes the check to exit non-zero.
 
 ## Operator security notes
 
@@ -217,6 +236,7 @@ When adding new admin-only entrypoints, reviewers must verify:
 
 ### ✅ Matrix Documentation
 - [ ] **Entry added to matrix**: New function documented in the matrix table above
+- [ ] **CI check passes**: `./scripts/check_admin_matrix.sh` succeeds locally
 - [ ] **Authorization model correctly described**: Explicit admin parameter vs stored admin loading
 - [ ] **Error behavior documented**: What happens with non-admin callers and stale admin after rotation
 - [ ] **Notes section populated**: Special behaviors, edge cases, or implementation details

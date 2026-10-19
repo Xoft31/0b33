@@ -202,7 +202,7 @@ impl CouponKey {
 }
 
 /// Dispute-domain storage keys: dispute records, escrow ledgers, the dispute ID
-/// counter, and the per-subscription active-dispute index.
+/// counter, the per-subscription active-dispute index, and global window config.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
 enum DisputeKey {
@@ -210,14 +210,16 @@ enum DisputeKey {
     Dispute = 50,
     NextDisputeId = 51,
     SubscriptionDispute = 52,
+    DisputeWindowSecs = 84,
 }
 
 impl DisputeKey {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::DisputeEscrow,
         Self::Dispute,
         Self::NextDisputeId,
         Self::SubscriptionDispute,
+        Self::DisputeWindowSecs,
     ];
 
     const fn claimed_discriminant(self) -> u32 {
@@ -230,6 +232,7 @@ impl DisputeKey {
             Self::Dispute => DataKey::Dispute(1),
             Self::NextDisputeId => DataKey::NextDisputeId,
             Self::SubscriptionDispute => DataKey::SubscriptionDispute(1),
+            Self::DisputeWindowSecs => DataKey::DisputeWindowSecs,
         }
     }
 }
@@ -290,9 +293,9 @@ impl GovernanceKey {
 /// This is the cross-version snapshot: it is written out longhand so that a
 /// future edit to any group is visible as an explicit change to a frozen list
 /// rather than an invisible renumbering.
-const GROUPED_DISCRIMINANT_SNAPSHOT: [u32; 47] = [
+const GROUPED_DISCRIMINANT_SNAPSHOT: [u32; 48] = [
     0, 2, 5, 6, 7, 8, 9, 10, 16, 17, 18, 19, 20, 22, 23, 28, 30, 32, 33, 34, 39, 40, 41, 45, 46,
-    47, 48, 49, 50, 51, 52, 53, 54, 56, 57, 60, 61, 64, 68, 69, 70, 71, 72, 73, 74, 76, 77,
+    47, 48, 49, 50, 51, 52, 53, 54, 56, 57, 60, 61, 64, 68, 69, 70, 71, 72, 73, 74, 76, 77, 84,
 ];
 
 fn all_grouped_discriminants() -> Vec<u32> {

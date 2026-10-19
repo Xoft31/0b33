@@ -60,9 +60,9 @@ CONTRACT_NAME="subscription_vault"
 NETWORK_NAME="${NETWORK_NAME:-local-dev}"
 RPC_URL="${RPC_URL:-http://localhost:8000/soroban/rpc}"
 NETWORK_PASSPHRASE="${NETWORK_PASSPHRASE:-Standalone Network ; February 2017}"
-ADMIN_IDENTITY="admin-local"
-SUBSCRIBER_IDENTITY="subscriber-local"
-MERCHANT_IDENTITY="merchant-local"
+ADMIN_IDENTITY="${ADMIN_IDENTITY:-admin-local}"
+SUBSCRIBER_IDENTITY="${SUBSCRIBER_IDENTITY:-subscriber-local}"
+MERCHANT_IDENTITY="${MERCHANT_IDENTITY:-merchant-local}"
 TOKEN_DECIMALS=7
 NETWORK_CONTAINER="stellabill-local"
 
@@ -482,7 +482,17 @@ ensure_identity() {
     "${CLI}" keys ls 2>/dev/null | grep -qF "${label}" && ident_exists=1
 
     if [ "${ident_exists}" = "1" ]; then
-        info "Identity '${label}' already exists."
+        if [ "${ALLOW_IDENTITY_REUSE:-false}" = "true" ]; then
+            warn "Identity '${label}' already exists — reusing (--allow-identity-reuse)."
+        else
+            err "Identity '${label}' already exists in the CLI keystore."
+            err "Reusing a stale identity can cause unexpected auth failures."
+            err "Fix by one of:"
+            err "  1. Remove it:  ${CLI} keys rm ${label}"
+            err "  2. Use a unique suffix:  ADMIN_IDENTITY=${label}-$$ $0"
+            err "  3. Explicitly allow reuse:  $0 --allow-identity-reuse"
+            exit 1
+        fi
     else
         info "Generating identity '${label}'..."
         run "${CLI}" keys generate "${label}"
@@ -951,6 +961,7 @@ main() {
             --no-docker) NO_DOCKER=true ;;
             --skip-smoke) SKIP_SMOKE=true ;;
             --allow-protocol-mismatch) ALLOW_PROTOCOL_MISMATCH=true ;;
+            --allow-identity-reuse) ALLOW_IDENTITY_REUSE=true ;;
             --*) warn "Unknown option: ${arg}" ;;
         esac
     done

@@ -1772,6 +1772,75 @@ fn test_remove_from_blocklist_fails_with_open_dispute() {
     assert_eq!(result, Err(Ok(Error::SubscriberHasOpenDisputes)));
 }
 
+#[test]
+fn test_merchant_blocklist_charge_continuity_soft_freeze() {
+    // Verify that blocklisting a merchant does NOT block subsequent charges.
+    // The merchant simply cannot withdraw. This tests the soft-freeze semantics
+    // documented in docs/blocklist.md section 7.
+    let test_env = TestEnv::default();
+    let subscriber = Address::generate(&test_env.env);
+    let merchant = Address::generate(&test_env.env);
+    test_env
+        .stellar_token_client()
+        .mint(&subscriber, &1_000_000_000i128);
+
+    // Create a subscription
+    let sub_id = test_env.client.create_subscription(
+        &subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    
+    // Deposit funds to cover charges
+    test_env.client.deposit_funds(&sub_id, &(AMOUNT * 10), &None::<soroban_sdk::BytesN<32>>);
+    
+    // First charge should succeed
+    let first_charge = test_env.client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
+    assert!(first_charge.is_ok());
+    let first_balance = test_env.client.get_merchant_balance(&merchant);
+    assert!(first_balance > 0);
+    
+    // Advance time for next interval
+    test_env.env.ledger().with_mut(|li| {
+        li.timestamp += INTERVAL + 1;
+    });
+    
+    // Blocklist the merchant
+    test_env.client.add_to_blocklist(
+        &test_env.admin,
+        &merchant,
+        &Some(String::from_str(&test_env.env, "Merchant fraud detected")),
+    );
+    
+    // Verify merchant is blocklisted
+    assert!(test_env.client.is_blocklisted(&merchant));
+    
+    // Second charge should STILL SUCCEED (not block for merchant blocklist)
+    // The charge completes and credits accumulate
+    let second_charge = test_env.client.try_charge_subscription(&sub_id, &None::<soroban_sdk::BytesN<32>>);
+    assert!(second_charge.is_ok());
+    
+    // Balance should have increased from the second charge
+    let new_balance = test_env.client.get_merchant_balance(&merchant);
+    assert_eq!(new_balance, first_balance + AMOUNT);
+    
+    // But merchant cannot WITHDRAW their earnings
+    let withdraw_result = test_env.client.try_withdraw_merchant_funds(&merchant, &new_balance);
+    assert_eq!(withdraw_result, Err(Ok(Error::SubscriberBlocklisted)));
+    
+    // After unblocking, merchant can withdraw
+    test_env.client.remove_from_blocklist(&test_env.admin, &merchant);
+    assert!(!test_env.client.is_blocklisted(&merchant));
+    test_env.client.withdraw_merchant_funds(&merchant, &new_balance);
+    let final_balance = test_env.client.get_merchant_balance(&merchant);
+    assert_eq!(final_balance, 0);
+}
+
 // -- Admin tests --------------------------------------------------------------
 
 #[test]
@@ -1858,21 +1927,26 @@ fn test_batch_charge() {
     assert_eq!(results.len(), 5);
 
     // id1: Success
+    assert_eq!(results.get(0).unwrap().subscription_id, id1);
     assert!(results.get(0).unwrap().success);
 
     // 999: NotFound (404)
+    assert_eq!(results.get(1).unwrap().subscription_id, 999);
     assert!(!results.get(1).unwrap().success);
     assert_eq!(results.get(1).unwrap().error_code, Error::NotFound as u32);
 
     // id2: InsufficientBalance (1003)
+    assert_eq!(results.get(2).unwrap().subscription_id, id2);
     assert!(!results.get(2).unwrap().success);
     assert_eq!(results.get(2).unwrap().error_code, Error::InsufficientBalance as u32);
 
     // id3: NotActive (1002)
+    assert_eq!(results.get(3).unwrap().subscription_id, id3);
     assert!(!results.get(3).unwrap().success);
     assert_eq!(results.get(3).unwrap().error_code, Error::NotActive as u32);
 
     // id4: IntervalNotElapsed (1001)
+    assert_eq!(results.get(4).unwrap().subscription_id, id4);
     assert!(!results.get(4).unwrap().success);
     assert_eq!(results.get(4).unwrap().error_code, Error::IntervalNotElapsed as u32);
 }
@@ -1883,17 +1957,52 @@ fn test_batch_charge_duplicate_ids() {
     env.ledger().set_timestamp(T0);
     let (id, _, _) = create_test_subscription(&env, &client, SubscriptionStatus::Active);
     seed_balance(&env, &client, id, PREPAID * 2);
+    let initial_nonce = client.get_admin_nonce();
 
     env.ledger().set_timestamp(T0 + INTERVAL + 1);
     let ids = Vec::from_array(&env, [id, id]);
-    
+
+    let detailed = client.batch_charge_detailed(&ids, &None, &initial_nonce);
+    assert_eq!(detailed.duplicate_id, Some(id));
+    assert!(detailed.results.is_empty());
+    assert_eq!(client.get_admin_nonce(), initial_nonce);
+
     // With the fix, duplicate IDs should be rejected upfront with InvalidInput
-    let result = client.try_batch_charge(&ids, &0u64);
+    let result = client.try_batch_charge(&ids, &initial_nonce);
     assert_eq!(result, Err(Ok(Error::InvalidInput)));
 
     // Verify no charge occurred since the batch was rejected
     let sub = client.get_subscription(&id);
     assert_eq!(sub.prepaid_balance, PREPAID * 2); // No charge should have happened
+}
+
+#[test]
+fn test_batch_charge_all_item_failures_leave_nonce_available() {
+    let (env, client, _, admin) = setup_test_env();
+    env.ledger().set_timestamp(T0);
+
+    let (paused_id, paused_subscriber, _) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    seed_balance(&env, &client, paused_id, PREPAID);
+    client.pause_subscription(&paused_id, &paused_subscriber);
+
+    let (chargeable_id, _, _) =
+        create_test_subscription(&env, &client, SubscriptionStatus::Active);
+    seed_balance(&env, &client, chargeable_id, PREPAID);
+
+    env.ledger().set_timestamp(T0 + INTERVAL + 1);
+    let nonce = client.get_admin_nonce(&admin, &0u32);
+    let failed_ids = Vec::from_array(&env, [paused_id]);
+    let failed_results = client.batch_charge(&failed_ids, &None, &nonce);
+
+    assert!(!failed_results.get(0).unwrap().success);
+    assert_eq!(client.get_admin_nonce(&admin, &0u32), nonce);
+
+    let retry_ids = Vec::from_array(&env, [chargeable_id, paused_id]);
+    let retry_results = client.batch_charge(&retry_ids, &None, &nonce);
+    assert!(retry_results.get(0).unwrap().success);
+    assert!(!retry_results.get(1).unwrap().success);
+    assert_eq!(client.get_admin_nonce(&admin, &0u32), nonce + 1);
 }
 
 #[test]
@@ -3843,7 +3952,8 @@ fn test_withdraw_merchant_funds_reduces_default_bucket_and_emits_event() {
         amount: 4_000_000i128,
         remaining_balance: 5_000_000i128,
         timestamp: env.ledger().timestamp(),
-        schema_version: crate::types::EVENT_SCHEMA_VERSION,
+        schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+        contract_id: client.address.clone(),
     }
     .into_val(&env);
     let event = MerchantWithdrawalEvent::try_from_val(&env, &encoded).unwrap();
@@ -3967,7 +4077,8 @@ fn test_withdraw_merchant_token_funds_only_debits_requested_bucket_and_emits_eve
         amount: 2_000_000i128,
         remaining_balance: 5_000_000i128,
         timestamp: env.ledger().timestamp(),
-        schema_version: crate::types::EVENT_SCHEMA_VERSION,
+        schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+        contract_id: client.address.clone(),
     }
     .into_val(&env);
     let event = MerchantWithdrawalEvent::try_from_val(&env, &encoded).unwrap();
@@ -4583,6 +4694,137 @@ fn test_get_subscriptions_by_token_pagination_and_count() {
         .client
         .get_subscriptions_by_token(&test_env.token, &1, &5);
     assert_eq!(rest.len(), 1);
+}
+
+#[test]
+fn test_list_subscriptions_by_token_cursor_pagination() {
+    let test_env = TestEnv::default();
+    let token_b = test_env
+        .env
+        .register_stellar_asset_contract_v2(test_env.admin.clone())
+        .address();
+    test_env
+        .client
+        .add_accepted_token(&test_env.admin, &token_b, &6);
+
+    let merchant = Address::generate(&test_env.env);
+    let first_a_subscriber = Address::generate(&test_env.env);
+    let second_a_subscriber = Address::generate(&test_env.env);
+    let third_a_subscriber = Address::generate(&test_env.env);
+    test_env.client.create_subscription(
+        &first_a_subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    test_env.client.create_subscription_with_token(
+        &Address::generate(&test_env.env),
+        &merchant,
+        &token_b,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    test_env.client.create_subscription(
+        &second_a_subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    test_env.client.create_subscription_with_token(
+        &Address::generate(&test_env.env),
+        &merchant,
+        &token_b,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    test_env.client.create_subscription(
+        &third_a_subscriber,
+        &merchant,
+        &AMOUNT,
+        &INTERVAL,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+    );
+
+    let page1 = test_env
+        .client
+        .list_subscriptions_by_token(&test_env.token, &None::<u32>, &2);
+    assert_eq!(page1.total, 3);
+    assert_eq!(page1.subscriptions.len(), 2);
+    assert_eq!(
+        page1.subscriptions.get(0).unwrap().subscriber,
+        first_a_subscriber
+    );
+    assert_eq!(
+        page1.subscriptions.get(1).unwrap().subscriber,
+        second_a_subscriber
+    );
+    assert_eq!(page1.next_cursor, Some(2));
+
+    let page2 = test_env
+        .client
+        .list_subscriptions_by_token(&test_env.token, &page1.next_cursor, &2);
+    assert_eq!(page2.total, 3);
+    assert_eq!(page2.subscriptions.len(), 1);
+    assert_eq!(
+        page2.subscriptions.get(0).unwrap().subscriber,
+        third_a_subscriber
+    );
+    assert_eq!(page2.next_cursor, None);
+
+    let token_b_page = test_env
+        .client
+        .list_subscriptions_by_token(&token_b, &None::<u32>, &2);
+    assert_eq!(token_b_page.total, 2);
+    assert_eq!(token_b_page.subscriptions.len(), 2);
+    assert!(token_b_page
+        .subscriptions
+        .iter()
+        .all(|sub| sub.token == token_b));
+    assert!(page1
+        .subscriptions
+        .iter()
+        .all(|sub| sub.token == test_env.token));
+
+    let empty = test_env
+        .client
+        .list_subscriptions_by_token(&test_env.token, &Some(3), &2);
+    assert!(empty.subscriptions.is_empty());
+    assert_eq!(empty.total, 3);
+    assert_eq!(empty.next_cursor, None);
+
+    assert_eq!(
+        test_env
+            .client
+            .try_list_subscriptions_by_token(&test_env.token, &None::<u32>, &0),
+        Err(Ok(Error::InvalidInput))
+    );
+    assert_eq!(
+        test_env.client.try_list_subscriptions_by_token(
+            &test_env.token,
+            &None::<u32>,
+            &(MAX_SUBSCRIPTION_LIST_PAGE + 1)
+        ),
+        Err(Ok(Error::InvalidInput))
+    );
 }
 
 // -- Subscriber withdrawal test -----------------------------------------------
@@ -8945,6 +9187,46 @@ mod storage_layout {
         }), "schema_migrated event must be emitted on upgrade");
     }
 
+    #[test]
+    fn test_migrate_verifies_rewritten_subscription_sample() {
+        let (env, client, _token, admin) = setup_test_env();
+        let (subscription_id, _, _) = create_test_subscription(
+            &env,
+            &client,
+            SubscriptionStatus::Active,
+        );
+
+        env.as_contract(&client.address, || {
+            env.storage()
+                .instance()
+                .set(&DataKey::SchemaVersion, &3u32);
+        });
+
+        client.migrate(&admin);
+
+        let migrated = env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .get::<_, Subscription>(&DataKey::Sub(subscription_id))
+                .expect("subscription must be readable after migration")
+        });
+        assert!(migrated.amount > 0);
+        assert!(migrated.interval_seconds > 0);
+        assert!(migrated.prepaid_balance >= 0);
+        assert!(migrated.lifetime_charged >= 0);
+    }
+
+    #[test]
+    fn test_migration_verification_rejects_wrong_schema_version() {
+        let (env, client, _token, _admin) = setup_test_env();
+
+        let result = env.as_contract(&client.address, || {
+            crate::admin::verify_migration(&env, crate::STORAGE_VERSION + 1)
+        });
+
+        assert_eq!(result, Err(Error::SchemaMigrationVerificationFailed));
+    }
+
     // -------------------------------------------------------------------------
     // 10. Error discriminants are stable
     //     Error codes are returned to callers and stored in BatchChargeResult.
@@ -10187,6 +10469,35 @@ fn test_usage_charge_with_reference_succeeds() {
 }
 
 #[test]
+fn test_usage_charge_blocked_after_auto_renew_window_closes() {
+    let (env, client, _, _) = setup_test_env();
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, subscriber, _) = setup_usage_sub(&env, &client);
+    client.set_auto_renew(&id, &subscriber, &false);
+
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL - 1);
+    let before_boundary = client.try_charge_usage_with_reference(
+        &id,
+        &1_000_000,
+        &String::from_str(&env, "auto-renew-before-boundary"),
+    );
+    assert_eq!(before_boundary, Ok(Ok(crate::UsageChargeResult::Charged)));
+
+    env.ledger()
+        .with_mut(|li| li.timestamp = T0 + INTERVAL);
+    let at_boundary = client.try_charge_usage_with_reference(
+        &id,
+        &1_000_000,
+        &String::from_str(&env, "auto-renew-at-boundary"),
+    );
+    assert_eq!(at_boundary, Err(Ok(Error::NotActive)));
+
+    let subscription = client.get_subscription(&id);
+    assert_eq!(subscription.prepaid_balance, PREPAID - 1_000_000);
+}
+
+#[test]
 fn test_usage_replay_protection() {
     let (env, client, _, _) = setup_test_env();
     env.ledger().with_mut(|li| li.timestamp = T0);
@@ -10240,6 +10551,36 @@ fn test_usage_burst_limit_exceeded() {
         &String::from_str(&env, "ref_b2"),
     );
     assert_eq!(r2, crate::UsageChargeResult::BurstLimitExceeded);
+}
+
+#[test]
+fn test_zero_burst_interval_disables_burst_limit() {
+    let (env, client, _, _) = setup_test_env();
+    env.ledger().with_mut(|li| li.timestamp = T0);
+    let (id, _, merchant) = setup_usage_sub(&env, &client);
+
+    client.configure_usage_limits(
+        &merchant,
+        &id,
+        &None::<u32>,
+        &0u64,
+        &0u64,
+        &None::<i128>,
+    );
+
+    let first = client.charge_usage_with_reference(
+        &id,
+        &1_000_000,
+        &String::from_str(&env, "ref_zero_burst_1"),
+    );
+    let second = client.charge_usage_with_reference(
+        &id,
+        &1_000_000,
+        &String::from_str(&env, "ref_zero_burst_2"),
+    );
+
+    assert_eq!(first, crate::UsageChargeResult::Charged);
+    assert_eq!(second, crate::UsageChargeResult::Charged);
 }
 
 #[test]

@@ -116,9 +116,9 @@ fn test_recovery_amount_validation() {
     );
     assert_eq!(result, Err(Ok(Error::InvalidRecoveryAmount)));
 
-    // Overdraw
+    // Overdraw is capped to the available recoverable balance.
     let rec_over = String::from_str(&env, "rec_over");
-    let result = client.try_recover_stranded_funds(
+    let result = client.recover_stranded_funds(
         &admin,
         &token_addr,
         &recipient,
@@ -126,7 +126,12 @@ fn test_recovery_amount_validation() {
         &rec_over,
         &RecoveryReason::UserOverpayment
     );
-    assert_eq!(result, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(result.recovered_amount, 100_000_000);
+    assert_eq!(result.surplus_amount, 100_000_000);
+    assert_eq!(
+        token::Client::new(&env, &token_addr).balance(&recipient),
+        100_000_000
+    );
 }
 
 /// Boundary: `recovery_amount == recoverable`, i.e. the admin sweeps the
@@ -136,9 +141,8 @@ fn test_recovery_amount_validation() {
 /// observes the post-transfer state where `contract_balance == total_accounted`
 /// (`recoverable == 0`). That boundary is worth pinning down because:
 ///
-/// * the guard is `amount > recoverable`, so equality must be *accepted* —
-///   an off-by-one here would strand the last unit of recoverable funds
-///   permanently;
+/// * an exact request transfers the full recoverable amount, while an
+///   oversized request is capped without touching accounted funds;
 /// * the transfer leaves the contract with a zero token balance, which is the
 ///   state a zero-balance invariant check has to tolerate rather than reject.
 ///
@@ -161,22 +165,9 @@ fn test_recovery_exact_balance_drains_contract_to_zero() {
     assert_eq!(before.total_prepaid, 0);
     assert_eq!(before.recoverable_amount, stranded);
 
-    // Amount 1 more than recoverable is rejected — the boundary is exact.
-    let rec_over = String::from_str(&env, "rec_exact_over");
-    let over = client.try_recover_stranded_funds(
-        &admin,
-        &token_addr,
-        &recipient,
-        &(stranded + 1),
-        &rec_over,
-        &RecoveryReason::UserOverpayment,
-    );
-    assert_eq!(over, Err(Ok(Error::InsufficientBalance)));
-    assert_eq!(balance_client.balance(&client.address), stranded);
-
     // Exactly the recoverable balance is accepted and zeroes the contract.
     let rec_exact = String::from_str(&env, "rec_exact_full");
-    client.recover_stranded_funds(
+    let exact = client.recover_stranded_funds(
         &admin,
         &token_addr,
         &recipient,
@@ -185,6 +176,8 @@ fn test_recovery_exact_balance_drains_contract_to_zero() {
         &RecoveryReason::UserOverpayment,
     );
 
+    assert_eq!(exact.recovered_amount, stranded);
+    assert_eq!(exact.surplus_amount, 0);
     assert_eq!(balance_client.balance(&client.address), 0, "full-drain recovery must leave the contract at zero balance");
     assert_eq!(balance_client.balance(&recipient), stranded, "recipient must receive the entire recovered amount");
 
@@ -198,8 +191,8 @@ fn test_recovery_exact_balance_drains_contract_to_zero() {
     assert_eq!(after.computed_total, 0);
     assert!(after.is_balanced, "an empty vault must still report is_balanced");
 
-    // Nothing is recoverable afterwards, so a second drain is rejected and
-    // leaves the zero balance untouched.
+    // Nothing is recoverable afterwards, so another request is a no-op and
+    // reports the full request as surplus.
     let rec_second = String::from_str(&env, "rec_exact_second");
     let second = client.try_recover_stranded_funds(
         &admin,
@@ -209,7 +202,13 @@ fn test_recovery_exact_balance_drains_contract_to_zero() {
         &rec_second,
         &RecoveryReason::UserOverpayment,
     );
-    assert_eq!(second, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(
+        second,
+        Ok(crate::RecoveryResult {
+            recovered_amount: 0,
+            surplus_amount: 1,
+        })
+    );
     assert_eq!(balance_client.balance(&client.address), 0);
     assert_eq!(balance_client.balance(&recipient), stranded);
 }
@@ -256,16 +255,18 @@ fn test_recovery_exact_surplus_leaves_accounted_funds_intact() {
     assert_eq!(before.recoverable_amount, surplus);
     assert!(before.is_balanced);
 
-    // Drain the surplus exactly.
+    // A request one unit above the surplus transfers only the available amount.
     let rec_exact = String::from_str(&env, "rec_exact_surplus");
-    client.recover_stranded_funds(
+    let result = client.recover_stranded_funds(
         &admin,
         &token_addr,
         &admin_recipient,
-        &surplus,
+        &(surplus + 1),
         &rec_exact,
         &RecoveryReason::UserOverpayment,
     );
+    assert_eq!(result.recovered_amount, surplus);
+    assert_eq!(result.surplus_amount, 1);
 
     // Contract now holds exactly the accounted funds — no more, no less.
     assert_eq!(balance_client.balance(&client.address), 50_000_000, "exact surplus drain must not touch accounted funds");
@@ -277,9 +278,9 @@ fn test_recovery_exact_surplus_leaves_accounted_funds_intact() {
     assert_eq!(after.contract_balance, 50_000_000);
     assert!(after.is_balanced, "balance identity must survive the exact drain");
 
-    // One more unit is not recoverable, but the subscription is still whole.
+    // No recoverable funds remain, but the subscription is still whole.
     let rec_over = String::from_str(&env, "rec_exact_surplus_over");
-    let over = client.try_recover_stranded_funds(
+    let over = client.recover_stranded_funds(
         &admin,
         &token_addr,
         &admin_recipient,
@@ -287,7 +288,13 @@ fn test_recovery_exact_surplus_leaves_accounted_funds_intact() {
         &rec_over,
         &RecoveryReason::UserOverpayment,
     );
-    assert_eq!(over, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(
+        over,
+        crate::RecoveryResult {
+            recovered_amount: 0,
+            surplus_amount: 1,
+        }
+    );
 
     // The subscription is still fully funded, so it charges normally after the
     // exact drain: 10 USDC moves from prepaid into merchant liabilities and the
@@ -369,8 +376,8 @@ fn test_state_consistency() {
     
     client.deposit_funds(&sub_id, &50_000_000i128, &None::<soroban_sdk::BytesN<32>>);
     
-    // Total accounted should be 50M. Contract balance is 50M.
-    // Try to recover 1 from accounted funds - should fail
+    // Total accounted and contract balance are both 50M. A request cannot
+    // recover those funds and reports the request as surplus.
     let rec_id = String::from_str(&env, "rec_steal");
     let result = client.try_recover_stranded_funds(
         &admin,
@@ -380,12 +387,18 @@ fn test_state_consistency() {
         &rec_id,
         &RecoveryReason::UserOverpayment
     );
-    assert_eq!(result, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(
+        result,
+        Ok(crate::RecoveryResult {
+            recovered_amount: 0,
+            surplus_amount: 1,
+        })
+    );
 
     // 2. Stranded funds arrive (20M)
     token_client.mint(&client.address, &20_000_000);
 
-    // 3. Try to over-recover (21M) - fails
+    // 3. Try to recover 1 unit more than the available surplus - it is capped.
     let rec_id2 = String::from_str(&env, "rec_over");
     let result2 = client.try_recover_stranded_funds(
         &admin,
@@ -395,17 +408,30 @@ fn test_state_consistency() {
         &rec_id2,
         &RecoveryReason::UserOverpayment
     );
-    assert_eq!(result2, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(
+        result2,
+        Ok(crate::RecoveryResult {
+            recovered_amount: 20_000_000,
+            surplus_amount: 1,
+        })
+    );
 
-    // 4. Exact recovery succeeds
+    // 4. Repeating the request after the surplus was exhausted is a no-op.
     let rec_id3 = String::from_str(&env, "rec_exact");
-    client.recover_stranded_funds(
+    let result3 = client.try_recover_stranded_funds(
         &admin,
         &token_addr,
         &recipient,
         &20_000_000,
         &rec_id3,
         &RecoveryReason::UserOverpayment
+    );
+    assert_eq!(
+        result3,
+        Ok(crate::RecoveryResult {
+            recovered_amount: 0,
+            surplus_amount: 20_000_000,
+        })
     );
 
     // 5. Normal operation still works (withdraw)
@@ -470,7 +496,13 @@ fn test_recovery_rejected_for_cancelled_subscription_funds() {
         &rec_id,
         &RecoveryReason::ExpiredEscrow,
     );
-    assert_eq!(attempt, Err(Ok(Error::InsufficientBalance)));
+    assert_eq!(
+        attempt,
+        Ok(crate::RecoveryResult {
+            recovered_amount: 0,
+            surplus_amount: 50_000_000,
+        })
+    );
     assert_eq!(balance_client.balance(&admin_recipient), 0i128);
 
     // After the subscriber withdraws, the refund has left the contract and the

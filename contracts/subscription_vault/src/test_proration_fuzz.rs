@@ -178,6 +178,17 @@ fn test_edge_case_i128_max_values() {
     assert!(prorated <= amount);
 }
 
+#[test]
+fn test_proration_large_amounts_when_intermediate_product_exceeds_u128() {
+    let interval = 100u64;
+    let remaining_seconds = 50u64;
+
+    for amount in [i128::MAX / 4, i128::MAX / 2] {
+        let result = calculate_prorated_first_charge(amount, interval, remaining_seconds);
+        assert_eq!(result, Ok(amount / 2));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fuzz Tests for `create_subscription` Expiration Boundary Values
 // ---------------------------------------------------------------------------

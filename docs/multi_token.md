@@ -35,6 +35,7 @@ Legacy `get_merchant_balance` and `withdraw_merchant_funds` continue to target t
 ## Query helper
 
 - `get_subscriptions_by_token(token, start, limit)` returns `Result<Vec<Subscription>, Error>` for paginated subscriptions; `limit` must be between `1` and `100` (same as merchant listing).
+- `list_subscriptions_by_token(token, cursor, limit)` returns a `SubscriptionsTokenPage` for cursor-paginated subscriptions in token-index insertion order. Pass `None` to start and the returned `next_cursor` to continue; `total` reports the token index length. `limit` must be between `1` and `100`.
 - `get_token_subscription_count(token)` returns the length of the token’s subscription id index for pagination metadata.
 
 ## Compatibility notes
@@ -69,4 +70,3 @@ When querying or migrating these balances:
 2. **Calculate normalized values**: If migrating balances to another vault or verifying accounting off-chain, multiply 7-decimal balances by `10^2` (i.e. `10^(9 - 7)`) to normalize them to the 9-decimal base:
    $$\text{Normalized Balance} = \text{Raw Balance} \times 100$$
 3. **Audit against normalized total**: Ensure the sum of normalized subscriber prepaid balances plus normalized merchant liabilities matches the normalized custody balance of the default token in the contract.
-

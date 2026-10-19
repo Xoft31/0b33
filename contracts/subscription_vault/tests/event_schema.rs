@@ -3,17 +3,207 @@
 extern crate alloc;
 
 use soroban_sdk::{
-    testutils::{Address as _, Events},
-    Address, Env, FromVal,
+    testutils::{Address as _, Events, Ledger as _},
+    Address, Env, FromVal, Symbol,
 };
 use subscription_vault::{
-    AdminRotatedEvent, SubscriptionCreatedEvent, SubscriptionVault, SubscriptionVaultClient,
-    EVENT_SCHEMA_VERSION, BlocklistAddedEvent, BlocklistRemovedEvent, NonceConsumedEvent,
+    AdminRotatedEvent, BatchSizeWarningEvent, SubscriptionCreatedEvent, SubscriptionVault,
+    SubscriptionVaultClient,
+    BASE_EVENT_SCHEMA_VERSION, NONCE_CONSUMED_EVENT_SCHEMA_VERSION,
+    SUBSCRIPTION_CHARGED_EVENT_SCHEMA_VERSION, BlocklistAddedEvent, BlocklistRemovedEvent,
+    NonceConsumedEvent,
     SubscriptionChargedEvent, SubscriptionCancelledEvent, SubscriptionExpiredEvent,
     FundsDepositedEvent, MerchantWithdrawalEvent, SubscriberWithdrawalEvent,
     GracePeriodEnteredEvent, SubscriptionResumedEvent, EmergencyStopEnabledEvent,
-    EmergencyStopDisabledEvent, AdminProposalCreatedEvent, ReferralAttributedEvent,
+    EmergencyStopDisabledEvent, EmergencyStopEvent, AdminProposalCreatedEvent,
+    ReferralAttributedEvent, BATCH_RECOMMENDED_SIZE,
 };
+
+#[test]
+fn batch_charge_emits_size_warning_only_above_recommended_size() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    client.init(&token, &6, &admin, &1_000_000i128, &3600u64);
+
+    let mut recommended_batch = soroban_sdk::Vec::new(&env);
+    for id in 0..BATCH_RECOMMENDED_SIZE {
+        recommended_batch.push_back(id);
+    }
+    client.batch_charge(&recommended_batch, &0u64);
+    assert!(!env.events().all().iter().any(|(_, topics, _)| {
+        topics
+            .get(0)
+            .map(|topic| {
+                Symbol::from_val(&env, &topic) == Symbol::new(&env, "batch_size_warning")
+            })
+            .unwrap_or(false)
+    }));
+
+    let mut oversized_recommended_batch = soroban_sdk::Vec::new(&env);
+    for id in 0..=BATCH_RECOMMENDED_SIZE {
+        oversized_recommended_batch.push_back(id);
+    }
+    client.batch_charge(&oversized_recommended_batch, &1u64);
+
+    let warning = env
+        .events()
+        .all()
+        .iter()
+        .find(|(_, topics, _)| {
+            topics
+                .get(0)
+                .map(|topic| {
+                    Symbol::from_val(&env, &topic) == Symbol::new(&env, "batch_size_warning")
+                })
+                .unwrap_or(false)
+        })
+        .expect("batch above recommended size must emit a warning event");
+    let event: BatchSizeWarningEvent = FromVal::from_val(&env, &warning.2);
+    assert_eq!(event.batch_size, BATCH_RECOMMENDED_SIZE + 1);
+    assert_eq!(event.recommended_max_size, BATCH_RECOMMENDED_SIZE);
+    assert_eq!(event.schema_version, BASE_EVENT_SCHEMA_VERSION);
+    assert_eq!(event.contract_id, contract_id);
+}
+
+#[test]
+fn test_batch_charge_events_include_nonce_and_standalone_events_do_not() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let initial_timestamp = 1_000_000;
+    env.ledger().set_timestamp(initial_timestamp);
+
+    let token_admin = Address::generate(&env);
+    let token = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    client.init(&token, &6, &admin, &1_000_000i128, &3600u64);
+
+    let token_client = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    token_client.mint(&subscriber, &2_000_000i128);
+    let subscription_id = client.create_subscription(
+        &subscriber,
+        &merchant,
+        &1_000_000i128,
+        &3600u64,
+        &true,
+        &None,
+        &None::<u64>,
+        &None::<u32>,
+    );
+    client.deposit_funds(
+        &subscription_id,
+        &2_000_000i128,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+
+    let mut ids = soroban_sdk::Vec::new(&env);
+    ids.push_back(subscription_id);
+    env.ledger().set_timestamp(initial_timestamp + 3600);
+    client.batch_charge(&ids, &0u64);
+
+    let events = env.events().all();
+    let mut charged = None;
+    let mut consumed_nonce = None;
+    for (_, topics, data) in events.iter() {
+        let Some(first_topic) = topics.get(0) else {
+            continue;
+        };
+        let first_topic = Symbol::from_val(&env, &first_topic);
+        if first_topic == Symbol::new(&env, "charged") {
+            let event: SubscriptionChargedEvent = FromVal::from_val(&env, &data);
+            charged = Some(event);
+        } else if first_topic == Symbol::new(&env, "nonce_consumed") {
+            let event: NonceConsumedEvent = FromVal::from_val(&env, &data);
+            consumed_nonce = Some(event);
+        }
+    }
+
+    let charged = charged.expect("batch must emit charge event");
+    assert_eq!(charged.batch_nonce, Some(0));
+    assert_eq!(
+        charged.schema_version,
+        SUBSCRIPTION_CHARGED_EVENT_SCHEMA_VERSION
+    );
+    assert_eq!(charged.prepaid_balance, 1_000_000);
+    let consumed_nonce = consumed_nonce.expect("batch must emit nonce event");
+    assert_eq!(
+        consumed_nonce.batch_nonce, Some(0)
+    );
+    assert_eq!(
+        consumed_nonce.schema_version,
+        NONCE_CONSUMED_EVENT_SCHEMA_VERSION
+    );
+
+    env.ledger().set_timestamp(initial_timestamp + 7200);
+    client.charge_subscription(
+        &subscription_id,
+        &None::<soroban_sdk::BytesN<32>>,
+    );
+    let events = env.events().all();
+    let mut standalone_charged = None;
+    for (_, topics, data) in events.iter() {
+        if let Some(first_topic) = topics.get(0) {
+            if Symbol::from_val(&env, &first_topic) == Symbol::new(&env, "charged") {
+                let event: SubscriptionChargedEvent = FromVal::from_val(&env, &data);
+                standalone_charged = Some(event);
+            }
+        }
+    }
+    let standalone_charged =
+        standalone_charged.expect("standalone call must emit charge event");
+    assert_eq!(standalone_charged.batch_nonce, None);
+    assert_eq!(standalone_charged.prepaid_balance, 0);
+}
+
+#[test]
+fn test_emergency_stop_events_share_common_schema() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let token_admin = Address::generate(&env);
+    let token_address = env
+        .register_stellar_asset_contract_v2(token_admin.clone())
+        .address();
+    let admin = Address::generate(&env);
+    let contract_id = env.register(SubscriptionVault, ());
+    let client = SubscriptionVaultClient::new(&env, &contract_id);
+    client.init(&token_address, &7u32, &admin, &1_000_000i128, &3600u64);
+
+    client.enable_emergency_stop(&admin);
+    let enabled: EmergencyStopEvent = FromVal::from_val(
+        &env,
+        &env.events()
+            .all()
+            .last()
+            .expect("enable event must be emitted")
+            .2,
+    );
+    assert_eq!(enabled.state, true);
+
+    client.disable_emergency_stop(&admin);
+    let disabled: EmergencyStopEvent = FromVal::from_val(
+        &env,
+        &env.events()
+            .all()
+            .last()
+            .expect("disable event must be emitted")
+            .2,
+    );
+    assert_eq!(disabled.state, false);
+}
 
 #[test]
 fn test_nonce_consumed_and_admin_rotated_events_emitted() {
@@ -47,7 +237,8 @@ fn test_nonce_consumed_and_admin_rotated_events_emitted() {
             .expect("admin rotation event must be emitted")
             .2,
     );
-    assert_eq!(admin_rotated.schema_version, EVENT_SCHEMA_VERSION);
+    assert_eq!(admin_rotated.contract_id, contract_id);
+    assert_eq!(admin_rotated.schema_version, BASE_EVENT_SCHEMA_VERSION);
 }
 
 #[test]
@@ -93,7 +284,8 @@ fn test_subscription_created_event_emitted() {
             .expect("subscription created event must be emitted")
             .2,
     );
-    assert_eq!(created.schema_version, EVENT_SCHEMA_VERSION);
+    assert_eq!(created.contract_id, contract_id);
+    assert_eq!(created.schema_version, BASE_EVENT_SCHEMA_VERSION);
 }
 
 // ---------------------------------------------------------------------------
@@ -216,10 +408,11 @@ mod exhaustive_event_schema_checks {
             .expect("SubscriptionCreatedEvent must be emitted");
 
         let created: SubscriptionCreatedEvent = FromVal::from_val(&env, &event.2);
+        assert_eq!(created.contract_id, contract_id);
         assert_eq!(
-            created.schema_version, EVENT_SCHEMA_VERSION,
+            created.schema_version, BASE_EVENT_SCHEMA_VERSION,
             "SubscriptionCreatedEvent must carry schema_version = {}",
-            EVENT_SCHEMA_VERSION
+            BASE_EVENT_SCHEMA_VERSION
         );
     }
 
@@ -256,10 +449,11 @@ mod exhaustive_event_schema_checks {
             .expect("AdminRotatedEvent must be emitted");
 
         let rotated: AdminRotatedEvent = FromVal::from_val(&env, &event.2);
+        assert_eq!(rotated.contract_id, contract_id);
         assert_eq!(
-            rotated.schema_version, EVENT_SCHEMA_VERSION,
+            rotated.schema_version, BASE_EVENT_SCHEMA_VERSION,
             "AdminRotatedEvent must carry schema_version = {}",
-            EVENT_SCHEMA_VERSION
+            BASE_EVENT_SCHEMA_VERSION
         );
     }
 
@@ -297,9 +491,9 @@ mod exhaustive_event_schema_checks {
         if let Some(event) = nonce_event {
             let consumed: NonceConsumedEvent = FromVal::from_val(&env, &event.2);
             assert_eq!(
-                consumed.schema_version, EVENT_SCHEMA_VERSION,
+                consumed.schema_version, NONCE_CONSUMED_EVENT_SCHEMA_VERSION,
                 "NonceConsumedEvent must carry schema_version = {}",
-                EVENT_SCHEMA_VERSION
+                NONCE_CONSUMED_EVENT_SCHEMA_VERSION
             );
         }
     }
@@ -325,8 +519,8 @@ mod exhaustive_event_schema_checks {
     #[test]
     fn new_event_types_must_include_schema_version_field() {
         // This test documents the invariant: Every new event added to the
-        // contract MUST include a `pub schema_version: u32` field set to
-        // EVENT_SCHEMA_VERSION at emission time.
+        // contract MUST include a `pub schema_version: u32` field set to that
+        // event type's version at emission time.
 
         // Failure to include this field will be caught by:
         // 1. Compile-time checks if the derive macro is configured to enforce it
@@ -336,12 +530,14 @@ mod exhaustive_event_schema_checks {
         // Enforcement strategy:
         // - All event structs use #[contracttype] derive
         // - All events must explicitly define schema_version field
-        // - All event emissions must set schema_version = EVENT_SCHEMA_VERSION
+        // - All event emissions must set the version for their event type
         // - Integration tests verify at least one event is emitted correctly
 
         assert!(
-            EVENT_SCHEMA_VERSION > 0,
-            "EVENT_SCHEMA_VERSION must be defined and > 0"
+            BASE_EVENT_SCHEMA_VERSION > 0
+                && NONCE_CONSUMED_EVENT_SCHEMA_VERSION > 0
+                && SUBSCRIPTION_CHARGED_EVENT_SCHEMA_VERSION > 0,
+            "Event schema versions must be defined and > 0"
         );
     }
 }

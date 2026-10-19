@@ -2,6 +2,8 @@
 
 Subscriptions with `usage_enabled=true` can define an optional per-period hard cap and a lifetime cap.
 
+Each individual usage charge is also capped at the subscription's recurring `amount`. A charge above that amount returns `UsageChargeResult::UsageCapExceeded` and does not debit prepaid funds. Governance can approve a merchant-scoped exception with a `SetUsageChargeCapOverride` proposal (`target` is the merchant; `target3` is `1` to enable or `0` to disable). When enabled, those subscriptions may charge up to their prepaid balance, subject to the other configured limits.
+
 ## Per-Period Caps
 
 Configured via `configure_usage_limits`:

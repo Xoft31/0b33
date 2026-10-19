@@ -29,10 +29,6 @@ use crate::types::{
     MerchantWhitelistModeEvent, MerchantWithdrawalEvent, PayoutSchedule, PlanDeprecatedEvent,
     PlanRegisteredEvent, PlanTemplate, ScheduledPayoutEvent, TokenEarnings,
     TokenReconciliationSnapshot, VacationEndedEvent, VacationStartedEvent, MAX_FEE_BIPS,
-    is_valid_allowed_operations, OP_CHARGE,
-    MerchantPausedEvent, MerchantRevokedEvent, MerchantUnpausedEvent, MerchantWhitelistModeEvent,
-    MerchantWithdrawalEvent, PayoutSchedule, PlanDeprecatedEvent, PlanRegisteredEvent,
-    PlanTemplate, ScheduledPayoutEvent, TokenEarnings, TokenReconciliationSnapshot, MAX_FEE_BIPS,
     is_valid_allowed_operations, OP_CHARGE, TOPIC_WITHDRAWN,
 };
 use soroban_sdk::{token, Address, Env, String, Symbol, Vec};
@@ -159,7 +155,8 @@ pub fn pause_merchant(env: &Env, merchant: Address) -> Result<(), Error> {
         MerchantPausedEvent {
             merchant,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -180,7 +177,8 @@ pub fn unpause_merchant(env: &Env, merchant: Address) -> Result<(), Error> {
         MerchantUnpausedEvent {
             merchant,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -257,7 +255,8 @@ pub fn set_merchant_vacation(
             start_ts,
             end_ts,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -283,7 +282,8 @@ pub fn clear_merchant_vacation(env: &Env, merchant: Address) -> Result<(), Error
             VacationEndedEvent {
                 merchant,
                 timestamp: env.ledger().timestamp(),
-                schema_version: crate::types::EVENT_SCHEMA_VERSION,
+                schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+                contract_id: env.current_contract_address(),
             },
         );
     }
@@ -355,7 +355,8 @@ pub fn set_merchant_fee_override(
             admin,
             fee_bps: Some(fee_bps),
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -389,7 +390,8 @@ pub fn clear_merchant_fee_override(
             admin,
             fee_bps: None,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -419,7 +421,8 @@ pub fn set_whitelist_mode(env: &Env, admin: Address, enabled: bool) -> Result<()
             enabled,
             admin,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -448,7 +451,7 @@ pub fn is_merchant_approved(env: &Env, merchant: &Address) -> bool {
 /// 3. Still withdraw all accumulated funds despite revocation
 pub fn require_merchant_approved(env: &Env, merchant: &Address) -> Result<(), Error> {
     // If whitelist mode is disabled, all merchants are implicitly approved
-    if !is_whitelist_mode_enabled(env) {
+    if !get_whitelist_mode(env) {
         return Ok(());
     }
     
@@ -477,7 +480,8 @@ pub fn approve_merchant(env: &Env, admin: Address, merchant: Address) -> Result<
             merchant,
             admin,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -497,7 +501,8 @@ pub fn revoke_merchant(env: &Env, admin: Address, merchant: Address) -> Result<(
             merchant,
             admin,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -571,7 +576,8 @@ pub fn set_tag_allowlist(env: &Env, admin: Address, tags: Vec<Symbol>) -> Result
             admin,
             tags,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -635,7 +641,8 @@ pub fn set_merchant_tags(
             admin,
             tags,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -695,7 +702,8 @@ pub fn initialize_merchant_config(
             fee_bips: config.fee_bips,
             allowed_operations: config.allowed_operations,
             timestamp: config.last_updated,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -728,7 +736,8 @@ pub fn set_merchant_config(
             fee_bips: updated_config.fee_bips,
             allowed_operations: updated_config.allowed_operations,
             timestamp,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -794,6 +803,86 @@ pub fn get_merchant_total_earnings(env: &Env, merchant: &Address) -> Vec<(Addres
         result.push_back((token, earnings));
     }
     result
+}
+
+/// Returns the breakdown of merchant earnings for a single token, including
+/// primary balance and all sub-account balances.
+///
+/// This is the recommended query for off-chain reporters to understand the
+/// complete earnings picture:
+/// - `primary_balance`: funds in the primary merchant account
+/// - `sub_account_balances`: funds isolated in registered sub-accounts
+/// - `total_balance`: sum of primary + all sub-accounts
+///
+/// The parent `TokenEarnings` records the total accrual (primary + sub-accounts),
+/// but the split between primary and sub-account storage is shown in the balance
+/// fields. Reconcile using `total_balance == primary_balance + sum(sub_account_balances)`.
+pub fn get_merchant_token_earnings_with_sub_accounts(
+    env: &Env,
+    merchant: &Address,
+    token: &Address,
+) -> crate::types::MerchantTokenEarningsWithSubAccounts {
+    let primary_earnings = get_merchant_token_earnings(env, merchant, token);
+    let primary_balance = get_merchant_balance_by_token(env, merchant, token);
+
+    // Fetch all sub-account labels and their balances
+    let sub_list_key = DataKey::MerchantSubAccountList(merchant.clone());
+    let labels: Vec<Symbol> = env.storage().instance().get(&sub_list_key).unwrap_or(Vec::new(env));
+
+    let mut sub_account_balances = Vec::new(env);
+    let mut total_sub_balance: i128 = 0;
+
+    for label in labels.iter() {
+        let balance = get_sub_account_balance(env, merchant, &label);
+        if balance > 0 {
+            sub_account_balances.push_back(crate::types::SubAccountBalance {
+                label: label.clone(),
+                balance,
+            });
+            total_sub_balance = total_sub_balance.saturating_add(balance);
+        }
+    }
+
+    let total_balance = primary_balance.saturating_add(total_sub_balance);
+
+    crate::types::MerchantTokenEarningsWithSubAccounts {
+        token: token.clone(),
+        primary_earnings,
+        primary_balance,
+        sub_account_balances,
+        total_balance,
+    }
+}
+
+/// Returns per-token earnings with sub-account breakdown for a merchant.
+///
+/// This is the full breakdown query: for each token the merchant has earned from,
+/// returns the primary balance, sub-account balances, and accrual history.
+pub fn get_merchant_total_earnings_with_sub_accounts(
+    env: &Env,
+    merchant: &Address,
+) -> Vec<crate::types::MerchantTokenEarningsWithSubAccounts> {
+    let key = DataKey::MerchantTokens(merchant.clone());
+    let tokens: Vec<Address> = env.storage().instance().get(&key).unwrap_or(Vec::new(env));
+    let mut result = Vec::new(env);
+    for token in tokens.iter() {
+        let breakdown = get_merchant_token_earnings_with_sub_accounts(env, merchant, &token);
+        result.push_back(breakdown);
+    }
+    result
+}
+
+/// Returns aggregated merchant balance for a token, including all sub-accounts.
+///
+/// This is the total balance available for all merchant operations (withdrawals, etc.):
+/// `aggregated_balance = primary_balance + sum(sub_account_balances)`
+///
+/// Note: The parent `TokenEarnings` already include sub-account amounts (for roll-up
+/// reporting), but they are stored in separate buckets. This function returns the
+/// practical total of all funds the merchant controls for this token.
+pub fn get_merchant_balance_aggregated(env: &Env, merchant: &Address, token: &Address) -> i128 {
+    let breakdown = get_merchant_token_earnings_with_sub_accounts(env, merchant, token);
+    breakdown.total_balance
 }
 
 pub fn get_reconciliation_snapshot(
@@ -1050,7 +1139,8 @@ pub fn withdraw_merchant_funds_for_token(
             amount,
             remaining_balance: new_balance,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
     env.events().publish(
@@ -1068,7 +1158,8 @@ pub fn withdraw_merchant_funds_for_token(
             refunded: 0,
             ledger_sequence: env.ledger().sequence(),
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1131,7 +1222,8 @@ pub fn merchant_refund(
             token: token_addr.clone(),
             amount,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1249,7 +1341,8 @@ fn flush_merchant_token(
             amount: balance,
             remaining_balance: 0,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1321,7 +1414,8 @@ pub fn do_flush_payouts(env: &Env, merchant: Address, caller: Address) -> Result
             caller,
             tokens_paid,
             timestamp: now,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1425,7 +1519,8 @@ pub fn update_merchant_config(
             fee_bips: config.fee_bips,
             allowed_operations: config.allowed_operations,
             timestamp: config.last_updated,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1577,6 +1672,7 @@ pub fn do_rotate_merchant_address(
             new_merchant,
             subscriptions_updated,
             timestamp: env.ledger().timestamp(),
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1621,7 +1717,8 @@ pub fn do_emit_merchant_balance_snapshot(
             refunded,
             ledger_sequence,
             timestamp,
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1678,7 +1775,8 @@ pub fn do_emit_all_balances_snapshot(
                     refunded,
                     ledger_sequence,
                     timestamp,
-                    schema_version: crate::types::EVENT_SCHEMA_VERSION,
+                    schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+                    contract_id: env.current_contract_address(),
                 };
 
                 env.events().publish(
@@ -1785,7 +1883,8 @@ pub fn do_register_plan(
             usage_enabled,
             lifetime_cap,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1849,7 +1948,8 @@ pub fn do_deprecate_plan(
             plan_id,
             merchant,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -1914,10 +2014,8 @@ pub fn register_sub_account(
     merchant.require_auth();
 
     // Reject empty labels
-    let label_str = label.to_str(env);
-    if label_str.len() == 0 {
-        return Err(Error::InvalidInput);
-    }
+    // `Symbol` values are non-empty by construction (Soroban rejects empty
+    // symbols), so no separate empty-label check is required.
 
     // Ensure merchant config exists (merchant must be initialized)
     let _config = get_merchant_config(env, merchant.clone()).ok_or(Error::NotFound)?;
@@ -1948,7 +2046,8 @@ pub fn register_sub_account(
             merchant: merchant.clone(),
             label: label.clone(),
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 
@@ -2068,7 +2167,8 @@ pub fn withdraw_sub_account_funds(
             amount,
             remaining_balance: new_balance,
             timestamp: env.ledger().timestamp(),
-            schema_version: crate::types::EVENT_SCHEMA_VERSION,
+            schema_version: crate::types::BASE_EVENT_SCHEMA_VERSION,
+            contract_id: env.current_contract_address(),
         },
     );
 

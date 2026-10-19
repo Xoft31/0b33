@@ -16,7 +16,7 @@
 use crate::types::{
     DataKey, Error, SubscriptionStatus, SubscriptionVault, SubscriptionVaultClient,
 };
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use soroban_sdk::{testutils::Address as _, Address, Env, Symbol};
 
 // ── constants ────────────────────────────────────────────────────────────────
 const T0: u64 = 1_000;
@@ -85,6 +85,22 @@ fn seed_merchant_balance(
             &DataKey::MerchantBalance(merchant.clone(), token.clone()),
             &balance,
         );
+    });
+}
+
+fn set_reentrancy_lock(
+    env: &Env,
+    client: &SubscriptionVaultClient,
+    entrypoint: &str,
+    locked: bool,
+) {
+    let key = Symbol::new(env, entrypoint);
+    env.as_contract(&client.address, || {
+        if locked {
+            env.storage().persistent().set(&key, &true);
+        } else {
+            env.storage().persistent().remove(&key);
+        }
     });
 }
 
@@ -510,6 +526,44 @@ fn test_refund_cumulative_cannot_exceed_deposit() {
 // =============================================================================
 // 6. REENTRANCY GUARD — lock lifecycle
 // =============================================================================
+
+/// Simulate a callback by pre-holding each entrypoint's persistent lock; re-entry
+/// must fail before it can read or mutate dispute state or transfer escrowed funds.
+#[test]
+fn test_dispute_entrypoints_reject_reentrant_calls() {
+    let (env, client, _, admin) = setup();
+    let subscriber = Address::generate(&env);
+
+    set_reentrancy_lock(&env, &client, "open_dispute", true);
+    assert_eq!(
+        client.try_open_dispute(
+            &subscriber,
+            &1u32,
+            &1i128,
+            &None::<soroban_sdk::BytesN<32>>,
+        ),
+        Err(Ok(Error::Reentrancy))
+    );
+    set_reentrancy_lock(&env, &client, "open_dispute", false);
+
+    set_reentrancy_lock(&env, &client, "respond_dispute", true);
+    assert_eq!(
+        client.try_respond_dispute(
+            &admin,
+            &1u64,
+            &None::<soroban_sdk::BytesN<32>>,
+        ),
+        Err(Ok(Error::Reentrancy))
+    );
+    set_reentrancy_lock(&env, &client, "respond_dispute", false);
+
+    set_reentrancy_lock(&env, &client, "resolve_dispute", true);
+    assert_eq!(
+        client.try_resolve_dispute(&admin, &1u64, &false),
+        Err(Ok(Error::Reentrancy))
+    );
+    set_reentrancy_lock(&env, &client, "resolve_dispute", false);
+}
 
 /// Guard invariant: ReentrancyGuard::lock sets a key and removes it on drop.
 /// Tests the lock is not left in storage after a normal operation.

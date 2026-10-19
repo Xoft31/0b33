@@ -4,14 +4,15 @@
 //!
 //! Subscription records live in **persistent** storage (`env.storage().persistent()`)
 //! keyed by [`DataKey::Sub`]. Persistent entries carry a *time-to-live* (TTL): they
-//! stay accessible only while `live_until_ledger >= current_ledger`. Every read
-//! (`get_subscription`) and write (`write_subscription`) bumps the entry's TTL via
+//! stay accessible only while `live_until_ledger >= current_ledger`. Record reads
+//! (`get_subscription` and list/reconciliation queries) and writes
+//! (`write_subscription`) bump the entry's TTL via
 //! `extend_ttl(SUB_TTL_THRESHOLD, SUB_TTL_EXTEND_TO)` — see
 //! `contracts/subscription_vault/src/subscription.rs` and `docs/storage_layout.md`.
 //!
-//! These tests force the entry past its TTL by advancing the ledger sequence and pin
-//! down three properties:
-//!
+//! These tests force entries past their TTL by advancing the ledger sequence. In
+//! addition to the boundary, exhaustion, and recovery checks below, they verify
+//! collection reads refresh TTLs, including for a paused subscription.
 //! 1. **Boundary** — the record is readable at *exactly* its last live ledger
 //!    (`created_seq + SUB_TTL_EXTEND_TO`).
 //! 2. **Exhaustion** — one ledger later the entry is expired and accessing it raises a
@@ -273,6 +274,45 @@ fn second_ttl_cycle_preserves_data_then_expires() {
     assert!(
         !read_succeeds(&client, id),
         "after the final refresh window lapses the entry must expire again"
+    );
+}
+
+#[test]
+fn merchant_list_read_refreshes_paused_subscription_ttl() {
+    let (env, client) = setup();
+    let id = create_sub(&env, &client);
+    let original = client.get_subscription(&id);
+    client.pause_subscription(&id, &original.subscriber);
+    keep_instance_alive(&env, &client.address);
+
+    set_seq(&env, LIVE_UNTIL);
+    let page = client.get_subscriptions_by_merchant(&original.merchant, &0, &1, &false);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().status, SubscriptionStatus::Paused);
+
+    set_seq(&env, LIVE_UNTIL + 1);
+    assert!(
+        read_succeeds(&client, id),
+        "a merchant list read must refresh the persistent subscription record"
+    );
+}
+
+#[test]
+fn token_list_read_refreshes_subscription_ttl() {
+    let (env, client) = setup();
+    let id = create_sub(&env, &client);
+    let original = client.get_subscription(&id);
+    keep_instance_alive(&env, &client.address);
+
+    set_seq(&env, LIVE_UNTIL);
+    let page = client.get_subscriptions_by_token(&original.token, &0, &1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(page.get(0).unwrap().token, original.token);
+
+    set_seq(&env, LIVE_UNTIL + 1);
+    assert!(
+        read_succeeds(&client, id),
+        "a token list read must refresh the persistent subscription record"
     );
 }
 

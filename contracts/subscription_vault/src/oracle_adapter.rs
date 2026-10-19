@@ -215,21 +215,18 @@ pub fn validate_price(
     if age > config.max_age_seconds {
         return Err(Error::OraclePriceStale);
     }
-    validate_sanity_band(env, &price.price, config)?;
-    Ok(price.price as u128)
+    let price_u128 = price.price as u128;
+    validate_sanity_band(env, &price_u128, config)?;
+    Ok(price_u128)
 }
 
-/// Validate that the price falls within the configured sanity band.
-fn validate_sanity_band(env: &Env, price: &u128, config: &OracleConfig) -> Result<(), Error> {
-    if let Some(min) = config.oracle_price_min {
-        if *price < min {
-            return Err(Error::OraclePriceInvalid);
-        }
-    }
-    if let Some(max) = config.oracle_price_max {
-        if *price > max {
-            return Err(Error::OraclePriceInvalid);
-        }
+/// Validate that a resolved price is strictly positive.
+///
+/// `OracleConfig` does not currently carry absolute price bounds, so the
+/// positive-price invariant is the sanity check every adapter can enforce.
+fn validate_sanity_band(_env: &Env, price: &u128, _config: &OracleConfig) -> Result<(), Error> {
+    if *price == 0 {
+        return Err(Error::OraclePriceInvalid);
     }
     Ok(())
 }

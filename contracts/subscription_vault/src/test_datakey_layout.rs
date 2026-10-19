@@ -8,7 +8,7 @@
 
 use crate::types::{DataKey, KycKey, KNOWN_INSTANCE_KEY_DISCRIMINANTS};
 use soroban_sdk::testutils::Address as _;
-use soroban_sdk::{Address, BytesN, Env, String, Symbol};
+use soroban_sdk::{Address, BytesN, Env, IntoVal, String, Symbol, TryFromVal, Val, Vec};
 
 fn env() -> Env {
     Env::default()
@@ -114,6 +114,115 @@ fn test_datakey_discriminants_snapshot() {
             "DataKey::{} discriminant changed — on-chain storage break",
             expected
         );
+    }
+}
+
+#[test]
+fn test_datakey_serialized_discriminants_snapshot() {
+    let env = env();
+    let addr = Address::generate(&env);
+    let addr2 = Address::generate(&env);
+    let zero_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let coupon = Symbol::new(&env, "c");
+
+    let cases: &[(u32, DataKey)] = &[
+        (0, DataKey::MerchantSubs(addr.clone())),
+        (1, DataKey::Token),
+        (2, DataKey::Admin),
+        (3, DataKey::MinTopup),
+        (4, DataKey::NextId),
+        (5, DataKey::SchemaVersion),
+        (6, DataKey::Sub(0)),
+        (7, DataKey::ChargedPeriod(0)),
+        (8, DataKey::IdemKey(0)),
+        (9, DataKey::EmergencyStop),
+        (10, DataKey::MerchantPaused(addr.clone())),
+        (11, DataKey::BillingStatement(0, 0)),
+        (12, DataKey::BillingStatementsBySubscription(0)),
+        (13, DataKey::BillingStatementsByMerchant(addr.clone())),
+        (14, DataKey::TotalAccounted(addr.clone())),
+        (15, DataKey::Recovery(String::from_str(&env, "r"))),
+        (16, DataKey::MerchantConfig(addr.clone())),
+        (17, DataKey::MerchantEarnings(addr.clone(), addr2.clone())),
+        (18, DataKey::MerchantTokens(addr.clone())),
+        (19, DataKey::UsageLimits(0)),
+        (20, DataKey::UsageState(0)),
+        (21, DataKey::GracePeriod),
+        (22, DataKey::FeeBps),
+        (23, DataKey::Treasury),
+        (24, DataKey::AcceptedTokens),
+        (25, DataKey::TokenDecimals(addr.clone())),
+        (26, DataKey::NextPlanId),
+        (27, DataKey::Plan(0)),
+        (28, DataKey::SubPlan(0)),
+        (29, DataKey::PlanMaxActive(0)),
+        (30, DataKey::CreditLimit(addr.clone(), addr2.clone())),
+        (31, DataKey::TokenSubs(addr.clone())),
+        (32, DataKey::SubscriberSubs(addr.clone())),
+        (33, DataKey::MerchantBalance(addr.clone(), addr2.clone())),
+        (34, DataKey::Blocklist(addr.clone())),
+        (35, DataKey::Oracle),
+        (36, DataKey::BillingPeriodSnapshot(0, 0)),
+        (37, DataKey::BillingPeriodSnapshotIndex(0)),
+        (38, DataKey::AdminNonce(addr.clone(), 0)),
+        (39, DataKey::Metadata(0, String::from_str(&env, "k"))),
+        (40, DataKey::MetadataKeys(0)),
+        (41, DataKey::Operator),
+        (42, DataKey::BillingRetentionConfig),
+        (43, DataKey::BillingStatementSequence(0)),
+        (44, DataKey::BillingStatementAggregate(0)),
+        (45, DataKey::MerchantMaxSubs(addr.clone())),
+        (46, DataKey::Guardians),
+        (47, DataKey::NextProposalId),
+        (48, DataKey::Proposal(0)),
+        (49, DataKey::DisputeEscrow(0)),
+        (50, DataKey::Dispute(0)),
+        (51, DataKey::NextDisputeId),
+        (52, DataKey::SubscriptionDispute(0)),
+        (53, DataKey::PayoutSchedule(addr.clone())),
+        (54, DataKey::PendingTreasuryChange),
+        (55, DataKey::TransferIntent(0)),
+        (56, DataKey::Kyc(KycKey::MerchantStatus(addr.clone()))),
+        (57, DataKey::Coupon(coupon.clone())),
+        (58, DataKey::CouponRedemptions(coupon.clone())),
+        (59, DataKey::Credential(0)),
+        (60, DataKey::AdminConfigLastChangedAt(zero_hash)),
+        (61, DataKey::SubscriberCreateCap),
+        (62, DataKey::SubscriberCreateWindow(addr.clone())),
+        (63, DataKey::MerchantWhitelistMode),
+        (64, DataKey::MerchantApproved(addr.clone())),
+        (65, DataKey::ChargeSalt(0)),
+        (66, DataKey::ChargeFailureCounter(0)),
+        (67, DataKey::AutoPauseThreshold),
+        (68, DataKey::BuyoutPremiumBps),
+        (69, DataKey::MerchantVacation(addr.clone())),
+        (70, DataKey::SubCoupon(0)),
+        (71, DataKey::SubCouponRedeemed(0, coupon)),
+        (72, DataKey::MerchantMultiSig(addr.clone())),
+        (73, DataKey::SubscriberActiveCount(addr.clone())),
+        (74, DataKey::SubscriberActiveCapOverride(addr.clone())),
+        (75, DataKey::TagAllowlist),
+        (76, DataKey::MerchantTags(addr.clone())),
+        (77, DataKey::FeeToken),
+        (78, DataKey::CancellationEscrow(0)),
+        (79, DataKey::MerchantFeeBps(addr.clone())),
+        (80, DataKey::OraclePriceHistoryMeta(addr.clone())),
+        (81, DataKey::OraclePriceHistoryEntry(addr.clone(), 0)),
+        (82, DataKey::DelegatedPayerGrant(addr.clone(), addr2.clone())),
+        (83, DataKey::SplitPayees(0)),
+        (84, DataKey::EmergencyWithdrawIntent(0)),
+        (85, DataKey::MerchantSubAccount(addr.clone(), Symbol::new(&env, "label"))),
+        (86, DataKey::MerchantSubAccountList(addr)),
+        (87, DataKey::DisputeWindowSecs),
+    ];
+
+    for (expected, key) in cases {
+        let serialized: Val = key.into_val(&env);
+        let fields = Vec::<Val>::try_from_val(&env, &serialized)
+            .expect("DataKey serializes to the contracttype enum vector");
+        let actual = u32::try_from_val(&env, &fields.get(0).unwrap())
+            .expect("serialized DataKey enum tag is a u32");
+        assert_eq!(actual, *expected, "serialized DataKey discriminant changed");
     }
 }
 

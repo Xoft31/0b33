@@ -224,6 +224,24 @@ fn test_active_to_insufficient_balance_via_underfunded_charge() {
     assert_eq!(sub_after.lifetime_charged, 0);
 }
 
+#[test]
+fn test_next_charge_info_keeps_grace_deadline_after_expiry() {
+    let (env, client, _, _) = setup();
+    let (id, _, _) = create_sub(&env, &client);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = T0 + INTERVAL + 1);
+    let result = client.try_charge_subscription(&id, &None::<soroban_sdk::BytesN<32>>);
+    assert_eq!(result, Ok(Ok(ChargeExecutionResult::InsufficientBalance)));
+
+    let grace_deadline = T0 + INTERVAL + 1 + GRACE_PERIOD;
+    env.ledger().with_mut(|l| l.timestamp = grace_deadline);
+
+    let info = client.get_next_charge_info(&id);
+    assert_eq!(info.status, SubscriptionStatus::InsufficientBalance);
+    assert_eq!(info.grace_deadline, Some(grace_deadline));
+}
+
 // ── Illegal transition: charge while Cancelled ────────────────────────────────
 
 /// Attempting to charge a Cancelled (terminal) subscription must return

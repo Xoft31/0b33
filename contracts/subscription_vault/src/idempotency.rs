@@ -149,9 +149,15 @@ pub(crate) fn check_key_at(
 /// `now` must be the current ledger timestamp so that the TTL check in
 /// `check_key` can determine whether each entry is still active.
 ///
-/// Expired entries are removed before insertion. If the buffer remains full,
-/// the oldest live entry is evicted.
-pub fn push_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>, now: u64) {
+/// Expired entries are removed before insertion.  If after pruning the buffer
+/// is still at `IDEM_HISTORY` capacity (all retained entries are live), this
+/// function returns [`Error::IdemBufferFull`] rather than evicting a live key.
+/// Silently overwriting a live slot would open a replay window: an attacker
+/// who evicted slot N could replay key N as a fresh charge.
+///
+/// Under normal billing cadences this error cannot occur: filling 64 slots
+/// within the 7-day TTL requires a charge every ~2.6 hours.
+pub fn push_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>, now: u64) -> Result<(), Error> {
     let mut buf = load_buffer(env, subscription_id);
     let ttl_secs = get_ttl_secs(env);
     let len = buf.entries.len();
@@ -172,13 +178,13 @@ pub fn push_key(env: &Env, subscription_id: u32, hashed: &BytesN<32>, now: u64) 
         buf.entries = retained;
     }
 
-    let entry = (hashed.clone(), now);
-    if buf.entries.len() < IDEM_HISTORY {
-        buf.entries.push_back(entry);
-    } else {
-        buf.entries.remove(0);
-        buf.entries.push_back(entry);
+    // After pruning expired entries, refuse to evict a live slot.
+    if buf.entries.len() >= IDEM_HISTORY {
+        return Err(Error::IdemBufferFull);
     }
+
+    buf.entries.push_back((hashed.clone(), now));
     buf.cursor = 0;
     save_buffer(env, subscription_id, &buf);
+    Ok(())
 }

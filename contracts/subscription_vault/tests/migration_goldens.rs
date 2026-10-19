@@ -10,10 +10,35 @@
 ///
 /// The golden files are stored at `tests/snapshots/migration_goldens/*.scval.hex`
 /// in deterministic hex-encoded ScVal format.
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
+use soroban_sdk::{
+    contracttype, testutils::Address as _, testutils::Ledger as _, Address, Env, IntoVal,
+    TryFromVal,
+};
 use std::fs;
 use std::path::PathBuf;
-use subscription_vault::{SubscriptionVault, SubscriptionVaultClient};
+use subscription_vault::{
+    SubscriptionStatus, SubscriptionSummary, SubscriptionVault, SubscriptionVaultClient,
+};
+
+// Frozen v1 wire shape from before expires_at_ledger was appended.
+#[contracttype]
+#[derive(Clone, Debug)]
+struct SubscriptionSummaryV1Fixture {
+    subscription_id: u32,
+    subscriber: Address,
+    merchant: Address,
+    token: Address,
+    amount: i128,
+    interval_seconds: u64,
+    last_payment_timestamp: u64,
+    status: SubscriptionStatus,
+    prepaid_balance: i128,
+    usage_enabled: bool,
+    lifetime_cap: Option<i128>,
+    lifetime_charged: i128,
+    start_time: u64,
+    expires_at: Option<u64>,
+}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Helper: Golden File Management
@@ -204,6 +229,52 @@ fn test_golden_subscription_summary_determinism() {
             "Subscription summary must match golden fixture"
         );
     }
+}
+
+/// The current summary decoder must accept the serialized v1 schema.
+#[test]
+fn test_deserializes_v1_subscription_summary_fixture() {
+    let env = Env::default();
+    let subscriber = Address::generate(&env);
+    let merchant = Address::generate(&env);
+    let token = Address::generate(&env);
+    let previous_schema_fixture = SubscriptionSummaryV1Fixture {
+        subscription_id: 7,
+        subscriber: subscriber.clone(),
+        merchant: merchant.clone(),
+        token: token.clone(),
+        amount: 10_000_000,
+        interval_seconds: 2_592_000,
+        last_payment_timestamp: 1_700_000_000,
+        status: SubscriptionStatus::Active,
+        prepaid_balance: 40_000_000,
+        usage_enabled: true,
+        lifetime_cap: Some(100_000_000),
+        lifetime_charged: 25_000_000,
+        start_time: 1_600_000_000,
+        expires_at: Some(1_900_000_000),
+    };
+
+    // Serialize with the frozen previous schema, then decode with today's type.
+    let serialized = previous_schema_fixture.into_val(&env);
+    let decoded =
+        SubscriptionSummary::try_from_val(&env, &serialized).expect("v1 summary must deserialize");
+
+    assert_eq!(decoded.subscription_id, 7);
+    assert_eq!(decoded.subscriber, subscriber);
+    assert_eq!(decoded.merchant, merchant);
+    assert_eq!(decoded.token, token);
+    assert_eq!(decoded.amount, 10_000_000);
+    assert_eq!(decoded.interval_seconds, 2_592_000);
+    assert_eq!(decoded.last_payment_timestamp, 1_700_000_000);
+    assert_eq!(decoded.status, SubscriptionStatus::Active);
+    assert_eq!(decoded.prepaid_balance, 40_000_000);
+    assert!(decoded.usage_enabled);
+    assert_eq!(decoded.lifetime_cap, Some(100_000_000));
+    assert_eq!(decoded.lifetime_charged, 25_000_000);
+    assert_eq!(decoded.start_time, 1_600_000_000);
+    assert_eq!(decoded.expires_at, Some(1_900_000_000));
+    assert_eq!(decoded.expires_at_ledger, None);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -240,6 +240,7 @@ fn soak_100k_query_budget_guardrails() {
                     dataset.dense_merchant.clone(),
                     0,
                     100,
+                    false,
                 )
                 .unwrap()
             })
@@ -260,6 +261,7 @@ fn soak_100k_query_budget_guardrails() {
                     dataset.dense_merchant.clone(),
                     500,
                     100,
+                    false,
                 )
                 .unwrap()
             })
@@ -280,6 +282,7 @@ fn soak_100k_query_budget_guardrails() {
                     dataset.dense_merchant.clone(),
                     900,
                     100,
+                    false,
                 )
                 .unwrap()
             })
@@ -300,6 +303,7 @@ fn soak_100k_query_budget_guardrails() {
                     dataset.single_subscription_merchant.clone(),
                     0,
                     100,
+                    false,
                 )
                 .unwrap()
             })

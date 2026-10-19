@@ -28,8 +28,8 @@ SUBMITTED → [VOTING PERIOD] → [ETA CHECK] → EXECUTED/CANCELLED
 ```
 
 1. **Submit** (`submit_proposal`): Create a new proposal with:
-   - Type: RotateAdmin, SetProtocolFee, or UpgradeContract
-   - Target parameters (new admin, treasury address, fee_bps)
+  - Type: RotateAdmin, SetProtocolFee, SetDisputeWindow, or UpgradeContract
+  - Target parameters (new admin, treasury address, fee_bps, or dispute-window seconds)
    - Quorum requirement in basis points (0-10000)
    - ETA (execution timestamp threshold)
 
@@ -83,10 +83,10 @@ pub struct Proposal {
 Submit a new governance proposal.
 
 - **Arguments:**
-  - `kind`: ProposalKind enum (RotateAdmin, SetProtocolFee, UpgradeContract)
+  - `kind`: ProposalKind enum (includes RotateAdmin, SetProtocolFee, SetDisputeWindow, UpgradeContract)
   - `target`: Primary target address (new admin or treasury)
   - `target2`: Optional secondary target
-  - `target3`: Tertiary parameter (0 or fee_bps)
+  - `target3`: Tertiary parameter (fee_bps or dispute-window seconds for `SetDisputeWindow`)
   - `quorum_bps`: Quorum in basis points (0-10000)
   - `eta`: Timestamp after which execution is allowed
 
@@ -322,7 +322,7 @@ client.remove_guardian(admin, guardian2)?;
 The implementation includes 11 core test cases covering:
 
 ✅ Guardian addition and removal
-✅ Proposal submission (RotateAdmin, SetProtocolFee)
+✅ Proposal submission (RotateAdmin, SetProtocolFee, SetDisputeWindow)
 ✅ Invalid quorum and ETA validation
 ✅ Vote casting and updates
 ✅ Proposal execution without quorum

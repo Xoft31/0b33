@@ -1,15 +1,24 @@
-# Subscriber Blocklist
+# Subscriber and Merchant Blocklist
 
 ## Overview
 
-The subscriber blocklist mechanism allows admins and merchants to prevent specific subscriber addresses from creating new subscriptions or using subscriber-controlled mutation flows that would extend, restore, or reconfigure access. This feature is designed for fraud prevention, dispute management, and access control while preserving existing financial obligations, balances, and an auditable admin-only unblock path.
+The blocklist mechanism allows admins and merchants to prevent specific addresses (subscribers and merchants) from performing sensitive operations. For **subscribers**, the blocklist prevents creating new subscriptions and using subscriber-controlled mutations. For **merchants**, the blocklist prevents fund withdrawal while still allowing charges to accumulate.
+
+This feature is designed for fraud prevention, dispute management, and access control while preserving existing financial obligations, balances, and an auditable admin-only unblock path.
+
+### Blocklist Behavior Summary
+
+| Address Type | Blocked Operations | Allowed Operations | Funds Handling |
+|---|---|---|---|
+| **Subscriber** | Create subscription, deposit, charge operations | Withdraw prepaid balance (fund return) | Existing balance preserved; new deposits blocked |
+| **Merchant** | Withdraw earnings | Receive charges (credits accumulate) | Charges continue; withdrawal frozen until unblocked |
 
 ## Key Principles
 
-1. **Preventive, Not Punitive**: The blocklist prevents blocked subscribers from creating or re-activating access but does not seize or move existing funds.
-2. **Existing Obligations Preserved**: Blocklisted subscribers retain access to their existing subscriptions and prepaid balances.
+1. **Preventive, Not Punitive**: The blocklist prevents blocked addresses from performing outbound/access-expansion operations but does not seize or move existing funds.
+2. **Existing Obligations Preserved**: Blocklisted addresses retain access to existing balances and subscriptions continue to function (with subscriber charges blocked only).
 3. **Dual Authorization**: Both admins (global) and merchants (scoped) can add subscribers to the blocklist.
-4. **Admin-Only Removal**: Only admins can remove subscribers from the blocklist.
+4. **Admin-Only Removal**: Only admins can remove addresses from the blocklist.
 5. **Stable Audit Trail**: Re-adding an already blocked subscriber is rejected so the original entry and reason are not overwritten.
 
 ## Authorization Model
@@ -274,9 +283,11 @@ let new_sub_id = client.create_subscription(
 
 **Rationale**: Resuming or migrating materially changes subscription access and commercial terms, so these flows are treated the same as creation and top-up paths.
 
-### 5. Charging is Blocked
+### 5. Charging is Blocked for Blocklisted Subscribers (Not Merchants)
 
-**Behavior**: Interval charges and usage charges are rejected for any subscription whose subscriber is blocklisted. The subscription remains open in its current state but cannot be billed until the subscriber is unblocked or the subscription is cancelled by the merchant or admin.
+**Behavior**: Interval charges and usage charges are rejected for any subscription whose **subscriber** is blocklisted. The subscription remains open in its current state but cannot be billed until the subscriber is unblocked or the subscription is cancelled by the merchant or admin.
+
+**Note on merchant blocklisting**: If a **merchant** is blocklisted, charges continue to succeed and credits accumulate in the vault (see section 7). The merchant simply cannot withdraw those earnings until unblocked.
 
 **Rationale**: Charging a blocklisted subscriber against their explicit blocked status is a conflict of intent. Merchants who want to conclude a relationship with a blocked subscriber should cancel the subscription via their own authorization.
 
@@ -286,11 +297,19 @@ let new_sub_id = client.create_subscription(
 
 **Rationale**: Preventing subscriber-initiated mutation stops a blocked subscriber from hiding from charges (pausing) or racing to cancel before a dispute resolves. The merchant and admin can still manage the subscription lifecycle on behalf of both parties.
 
-### 7. Merchant Withdrawal Blocked When Merchant is Blocklisted
+### 7. Merchant Withdrawal and Crediting Blocked When Merchant is Blocklisted
 
-**Behavior**: If a merchant address is itself blocklisted (e.g., for fraud), they cannot withdraw accumulated earnings. The funds remain in the vault's accounting ledger and are released when the admin removes the block.
+**Behavior**: If a merchant address is itself blocklisted (e.g., for fraud):
+- The merchant cannot withdraw accumulated earnings via `withdraw_merchant_funds` or `withdraw_merchant_funds_for_token`.
+- The funds remain in the vault's accounting ledger and are released when the admin removes the block.
+- **Charging does not block** — subscription charges continue to succeed and credits accumulate in the vault, but the blocklisted merchant cannot retrieve them until unblocked.
 
-**Rationale**: Unified enforcement using the same `require_not_blocklisted` guard. Any address — subscriber or merchant — blocked on this contract loses access to outgoing fund flows.
+**Rationale**: Unified enforcement using the same `require_not_blocklisted` guard. The blocklist enforces **outbound fund flows** (withdrawal), creating a soft freeze that preserves subscription continuity while preventing capital extraction. This allows:
+- Subscriber-billed charges to complete and accumulate earnings
+- Merchant earnings to be preserved during the block period
+- Admin to unblock and restore merchant access without disrupting subscriptions
+
+This is by design: the blocklist is preventive (blocks access to fund extraction), not punitive (does not seize or halt billing).
 
 ### 8. Withdrawal Rights for Subscribers
 
@@ -330,18 +349,25 @@ let new_sub_id = client.create_subscription(
 - Prevents unexpected state changes for active subscriptions
 - Maintains contract predictability
 
+### 6. Merchant Blocklist Timing and Charge Continuity
+
+- Merchant blocklist status is checked at charge entry time (for `charge_one`), preventing charges *initiated* by blocklisted merchants or their split payees.
+- If a merchant is blocklisted **after** a charge completes its validation phase but **before** a subsequent charge, the new charge is rejected with `SubscriberBlocklisted`.
+- Credits to blocklisted merchant sub-accounts are **not retroactively blocked** — charges that completed before blocklisting took effect have already routed their credits to sub-accounts or merchant balances. This reflects the soft-freeze semantics: blocklisting prevents **withdrawal** (outbound), not **crediting** (inbound from completed charges).
+- This design preserves subscription continuity: blocklisting a merchant does not halt ongoing subscriber charges; it only freezes the merchant's ability to extract those funds.
+
 ## Testing Coverage
 
 The blocklist implementation includes tests covering:
 
-**Core blocklist management (`test_blocklist.rs` / `test_governance.rs`):**
+**Core blocklist management (`test.rs` / `test_governance.rs`):**
 - Admin add and admin-only removal
 - Duplicate add rejection without entry mutation
 - Missing-entry unblock rejection
 - Add/remove event emission and payload verification
 - `None` and empty-string reason variants
 
-**Enforcement (`test_blocklist_enforcement.rs`):**
+**Enforcement and continuity (`test.rs`):**
 - Blocked: create subscription, deposit funds
 - Blocked: interval charge and usage charge while subscriber is blocklisted
 - Blocked: subscriber self-pause, self-cancel, self-resume
@@ -351,6 +377,7 @@ The blocklist implementation includes tests covering:
 - Block-after-creation: subscription balance and status preserved, subsequent deposits blocked
 - Unblock restores full subscriber access (create, deposit, pause)
 - Blocked merchant earnings preserved; withdrawal unlocked after admin unblocks merchant
+- **`test_merchant_blocklist_charge_continuity_soft_freeze`**: Explicitly verifies that blocklisting a merchant does **not** prevent charges — charges succeed and credits accumulate, but the merchant cannot withdraw until unblocked (soft-freeze semantics)
 
 ## Operational Guidance
 

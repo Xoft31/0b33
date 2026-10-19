@@ -42,7 +42,7 @@
 //! | `schedule_cancel` | [`crate::subscription::do_schedule_cancel`] |
 //! | `unschedule_cancel` | [`crate::subscription::do_unschedule_cancel`] |
 //! | `set_auto_renew` | [`crate::subscription::do_set_auto_renew`] |
-//! | `set_subscription_expiration_ledger` | [`crate::subscription::do_set_subscription_expiration_ledger`] |
+//! | `set_subscription_expiry_ledger` | [`crate::subscription::do_set_subscription_expiration_ledger`] |
 //! | `pause_subscription` | [`crate::subscription::do_pause_subscription`] |
 //! | `resume_subscription` | [`crate::subscription::do_resume_subscription`] |
 //! | `cleanup_subscription` | [`crate::subscription::do_cleanup_subscription`] |
@@ -118,6 +118,7 @@
 //! | `get_cap_info` | [`crate::queries::get_cap_info`] |
 //! | `get_token_subscription_count` | [`crate::queries::get_token_subscription_count`] |
 //! | `get_subscriptions_by_token` | [`crate::queries::get_subscriptions_by_token`] |
+//! | `list_subscriptions_by_token` | [`crate::queries::list_subscriptions_by_token`] |
 //!
 //! ## Metadata
 //! | Entrypoint | Delegate |
@@ -156,6 +157,7 @@ pub use crate::nonce::get_nonce;
 pub use crate::queries::{
     estimate_topup_for_intervals, get_cap_info, get_next_charge_info, get_subscription,
     get_subscriptions_by_token, get_token_subscription_count, list_subscriptions_by_subscriber,
+    list_subscriptions_by_token,
     get_plan_max_active_subs,
 };
 pub use crate::subscription::{

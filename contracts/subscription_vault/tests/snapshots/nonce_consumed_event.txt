@@ -1,7 +1,9 @@
-topic: ("nonce_consumed", <signer Address>, "adm_rot"|"batch")
+﻿topic: ("nonce_consumed", <signer Address>, "adm_rot"|"batch")
 data:
   signer: <Address>
   domain: <u32>
   nonce: <u64>
   timestamp: <u64>
-  schema_version: 2
+  schema_version: 4
+  batch_nonce: <Option<u64>>
+  contract_id: <Address>

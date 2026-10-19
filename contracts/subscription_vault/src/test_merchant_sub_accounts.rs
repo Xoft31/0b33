@@ -501,3 +501,358 @@ fn revoked_sub_account_cannot_withdraw() {
     // Balance should remain unchanged
     assert_eq!(client.get_sub_account_balance(&merchant, &sales_label), 500);
 }
+
+// ── Tests for new sub-account earnings aggregation queries ──────────────────
+
+#[test]
+fn get_merchant_token_earnings_with_sub_accounts_no_subs() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&merchant, &1000);
+    client.deposit_funds(
+        &client.create_subscription(
+            &merchant,
+            &merchant,
+            &token,
+            &100,
+            &86400,
+            &false,
+            &None::<i128>,
+            &None::<u64>,
+            &None::<u32>,
+            &None::<Symbol>,
+        ).unwrap(),
+        &1000,
+        &None,
+    );
+
+    let sub_id = client.create_subscription(
+        &merchant,
+        &merchant,
+        &token,
+        &100,
+        &86400,
+        &false,
+        &None::<i128>,
+        &None::<u64>,
+        &None::<u32>,
+        &None::<Symbol>,
+    ).unwrap();
+    client.deposit_funds(&sub_id, &1000, &None);
+    client.charge_subscription(&sub_id, &None);
+
+    // Query the new endpoint for no sub-accounts case
+    let breakdown = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+
+    // Should have zero sub-accounts
+    assert_eq!(breakdown.sub_account_balances.len(), 0);
+    // Primary balance should equal the merchant's charged amount (minus any fees)
+    assert!(breakdown.primary_balance > 0);
+    // Total should equal primary since there are no sub-accounts
+    assert_eq!(breakdown.total_balance, breakdown.primary_balance);
+    // Earnings should match
+    assert_eq!(breakdown.primary_earnings.accruals.interval, 100);
+}
+
+#[test]
+fn get_merchant_token_earnings_with_sub_accounts_single_sub() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &10000);
+
+    let sales = label(&env, "sales");
+    client.register_sub_account(&merchant, &sales);
+
+    let subscriber = Address::generate(&env);
+    stellar.mint(&subscriber, &10000);
+
+    let sub_id = client
+        .create_subscription_with_token(
+            &subscriber,
+            &merchant,
+            &token,
+            &500,
+            &86400,
+            &false,
+            &None::<i128>,
+            &None::<u64>,
+            &None::<u32>,
+            &Some(sales.clone()),
+        )
+        .unwrap();
+
+    client.deposit_funds(&sub_id, &2500, &None);
+    client.charge_subscription(&sub_id, &None);
+
+    // Query with sub-account
+    let breakdown = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+
+    // Should have exactly one sub-account
+    assert_eq!(breakdown.sub_account_balances.len(), 1);
+    assert_eq!(breakdown.sub_account_balances[0].label, sales);
+    assert_eq!(breakdown.sub_account_balances[0].balance, 500);
+
+    // Primary balance should be zero (all funds routed to sub-account)
+    assert_eq!(breakdown.primary_balance, 0);
+
+    // Total should equal sub-account balance
+    assert_eq!(breakdown.total_balance, 500);
+
+    // Earnings should reflect the charge
+    assert_eq!(breakdown.primary_earnings.accruals.interval, 500);
+}
+
+#[test]
+fn get_merchant_token_earnings_with_sub_accounts_multiple_subs() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &50000);
+
+    let sales = label(&env, "sales");
+    let support = label(&env, "support");
+    let ops = label(&env, "ops");
+
+    client.register_sub_account(&merchant, &sales);
+    client.register_sub_account(&merchant, &support);
+    client.register_sub_account(&merchant, &ops);
+
+    // Manually credit different amounts to each
+    crate::merchant::credit_sub_account(&env, &merchant, &sales, &token, 1000).unwrap();
+    crate::merchant::credit_sub_account(&env, &merchant, &support, &token, 2000).unwrap();
+    crate::merchant::credit_sub_account(&env, &merchant, &ops, &token, 500).unwrap();
+
+    let breakdown = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+
+    // Should have all three sub-accounts
+    assert_eq!(breakdown.sub_account_balances.len(), 3);
+    assert_eq!(breakdown.total_balance, 3500);
+    assert_eq!(breakdown.primary_balance, 0); // No primary balance in this scenario
+
+    // Verify each sub-account is listed
+    let mut found = vec![false; 3];
+    for sub in breakdown.sub_account_balances.iter() {
+        if sub.label == sales && sub.balance == 1000 {
+            found[0] = true;
+        }
+        if sub.label == support && sub.balance == 2000 {
+            found[1] = true;
+        }
+        if sub.label == ops && sub.balance == 500 {
+            found[2] = true;
+        }
+    }
+    assert_eq!(found, vec![true, true, true]);
+}
+
+#[test]
+fn get_merchant_token_earnings_with_sub_accounts_mixed_primary_and_subs() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &50000);
+
+    let sales = label(&env, "sales");
+    client.register_sub_account(&merchant, &sales);
+
+    let subscriber1 = Address::generate(&env);
+    let subscriber2 = Address::generate(&env);
+    stellar.mint(&subscriber1, &10000);
+    stellar.mint(&subscriber2, &10000);
+
+    // Charge 1: routes to primary (no sub_account_label)
+    let sub_id_primary = client
+        .create_subscription_with_token(
+            &subscriber1,
+            &merchant,
+            &token,
+            &300,
+            &86400,
+            &false,
+            &None::<i128>,
+            &None::<u64>,
+            &None::<u32>,
+            &None::<Symbol>,
+        )
+        .unwrap();
+    client.deposit_funds(&sub_id_primary, &1000, &None);
+    client.charge_subscription(&sub_id_primary, &None);
+
+    // Charge 2: routes to sub-account (with sub_account_label)
+    let sub_id_sub = client
+        .create_subscription_with_token(
+            &subscriber2,
+            &merchant,
+            &token,
+            &200,
+            &86400,
+            &false,
+            &None::<i128>,
+            &None::<u64>,
+            &None::<u32>,
+            &Some(sales.clone()),
+        )
+        .unwrap();
+    client.deposit_funds(&sub_id_sub, &1000, &None);
+    client.charge_subscription(&sub_id_sub, &None);
+
+    let breakdown = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+
+    // Should have both primary and sub-account balances
+    assert_eq!(breakdown.primary_balance, 300);
+    assert_eq!(breakdown.sub_account_balances.len(), 1);
+    assert_eq!(breakdown.sub_account_balances[0].balance, 200);
+
+    // Total should be the sum
+    assert_eq!(breakdown.total_balance, 500);
+
+    // Earnings should reflect both charges
+    assert_eq!(breakdown.primary_earnings.accruals.interval, 500);
+}
+
+#[test]
+fn get_merchant_total_earnings_with_sub_accounts_single_token() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &10000);
+
+    let sales = label(&env, "sales");
+    client.register_sub_account(&merchant, &sales);
+
+    crate::merchant::credit_sub_account(&env, &merchant, &sales, &token, 1000).unwrap();
+
+    let all_earnings = client.get_merchant_total_earnings_with_sub_accounts(&merchant);
+
+    // Should have exactly one entry (one token)
+    assert_eq!(all_earnings.len(), 1);
+    assert_eq!(all_earnings[0].token, token);
+    assert_eq!(all_earnings[0].total_balance, 1000);
+}
+
+#[test]
+fn get_merchant_balance_aggregated() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &10000);
+
+    let sales = label(&env, "sales");
+    let support = label(&env, "support");
+    client.register_sub_account(&merchant, &sales);
+    client.register_sub_account(&merchant, &support);
+
+    crate::merchant::credit_sub_account(&env, &merchant, &sales, &token, 1000).unwrap();
+    crate::merchant::credit_sub_account(&env, &merchant, &support, &token, 500).unwrap();
+
+    // Query aggregated balance
+    let total = client.get_merchant_balance_aggregated(&merchant, &token);
+
+    // Should equal the sum of all sub-accounts
+    assert_eq!(total, 1500);
+}
+
+#[test]
+fn accounting_invariant_with_sub_accounts() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &50000);
+
+    let sales = label(&env, "sales");
+    client.register_sub_account(&merchant, &sales);
+
+    let subscriber = Address::generate(&env);
+    stellar.mint(&subscriber, &10000);
+
+    let sub_id = client
+        .create_subscription_with_token(
+            &subscriber,
+            &merchant,
+            &token,
+            &250,
+            &86400,
+            &false,
+            &None::<i128>,
+            &None::<u64>,
+            &None::<u32>,
+            &Some(sales.clone()),
+        )
+        .unwrap();
+
+    client.deposit_funds(&sub_id, &1000, &None);
+    client.charge_subscription(&sub_id, &None);
+
+    let breakdown = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+
+    // Verify the accounting invariant:
+    // primary_earnings.accruals - withdrawals - refunds == total_balance
+    let computed = breakdown.primary_earnings.accruals.interval
+        + breakdown.primary_earnings.accruals.usage
+        + breakdown.primary_earnings.accruals.one_off
+        - breakdown.primary_earnings.withdrawals
+        - breakdown.primary_earnings.refunds;
+
+    assert_eq!(computed, breakdown.total_balance);
+}
+
+#[test]
+fn sub_account_withdrawal_updates_breakdown() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &10000);
+
+    let sales = label(&env, "sales");
+    client.register_sub_account(&merchant, &sales);
+
+    crate::merchant::credit_sub_account(&env, &merchant, &sales, &token, 1000).unwrap();
+
+    // Before withdrawal
+    let breakdown_before = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+    assert_eq!(breakdown_before.sub_account_balances[0].balance, 1000);
+    assert_eq!(breakdown_before.total_balance, 1000);
+
+    // Withdraw from sub-account
+    client.withdraw_sub_account_funds(&merchant, &sales, &token, &400);
+
+    // After withdrawal
+    let breakdown_after = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+    assert_eq!(breakdown_after.sub_account_balances[0].balance, 600);
+    assert_eq!(breakdown_after.total_balance, 600);
+    // Earnings should show the withdrawal
+    assert_eq!(breakdown_after.primary_earnings.withdrawals, 400);
+}
+
+#[test]
+fn backward_compatibility_old_queries_unchanged() {
+    let (env, client, _admin, token) = setup();
+    let merchant = create_merchant(&client, &env);
+
+    let stellar = soroban_sdk::token::StellarAssetClient::new(&env, &token);
+    stellar.mint(&env.current_contract_address(), &10000);
+
+    let sales = label(&env, "sales");
+    client.register_sub_account(&merchant, &sales);
+
+    crate::merchant::credit_sub_account(&env, &merchant, &sales, &token, 1000).unwrap();
+
+    // Old endpoint should still return only primary balance
+    let primary_only = client.get_merchant_balance_by_token(&merchant, &token);
+    assert_eq!(primary_only, 0); // Primary has zero, all is in sub-account
+
+    // New endpoint should show the breakdown
+    let breakdown = client.get_merchant_token_earnings_with_sub_accounts(&merchant, &token);
+    assert_eq!(breakdown.primary_balance, 0);
+    assert_eq!(breakdown.total_balance, 1000);
+}
